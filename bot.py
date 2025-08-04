@@ -606,7 +606,7 @@ def shutdown(signum, frame):
 def main():
     global capital
     # 1) Log in once at startup
-    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.2\n")
+    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.3\n")
     print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔐 Logging into Robinhood…")
     r.authentication.login(RH_USERNAME, RH_PASSWORD)
     print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ✅ Logged in.")
