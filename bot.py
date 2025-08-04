@@ -617,7 +617,7 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
 
     # Schedule entry at 09:00 ET (08:00 CST)
-    schedule.every().day.at("15:15").do(run_daily_entry)
+    schedule.every().day.at("15:20").do(run_daily_entry)
 
     # Schedule exit checks every 15 minutes
     schedule.every(5).minutes.do(run_exit_checks)
