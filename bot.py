@@ -485,7 +485,7 @@ def load_state():
             open_trades = data["open_trades"]
 
 def run_daily_entry():
-    tickers = random.sample(get_sp500_tickers(), 15)
+    tickers = random.sample(get_sp500_tickers(), 70)
     results = []
 
     print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔍 Evaluating {len(tickers)} tickers...\n")
@@ -628,7 +628,7 @@ def shutdown(signum, frame):
 def main():
     global capital
     # 1) Log in once at startup
-    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.4\n")
+    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.5\n")
     print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔐 Logging into Robinhood…")
     r.authentication.login(RH_USERNAME, RH_PASSWORD)
     print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ✅ Logged in.")
