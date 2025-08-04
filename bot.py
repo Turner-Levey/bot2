@@ -8,7 +8,7 @@ import re
 import signal
 import sys
 from openai import OpenAI
-from datetime import datetime, timedelta, date  # make sure `date` is imported too
+from datetime import datetime, timedelta, date, time as dtime  # make sure `date` is imported too
 import pytz
 from tqdm import tqdm
 import time
@@ -72,6 +72,8 @@ def format_prompt_from_data(data_line, options_data):
 
         Only consider strike prices that are near-the-money (within ~5% of the current stock price), unless you clearly justify using a farther OTM strike due to cost, expected volatility, or directional conviction.
 
+        It is critical for you to take into account that the max holding time for these options is a max of 48 hours. This means that your confidence score and rationale should reflect a relatively quick directional move.
+        
         ---
 
         📈 Stock Data:
@@ -160,6 +162,7 @@ def format_validation_prompt(top5_trades_text, expiration_lookup):
 
         Your job is to:
         - Identify any invalid trades (based on price logic, spread, volume, IV Rank, DTE rules, etc.)
+        - Verify that the confidence score makes sense for a quick (48 hr) hold period
         - Correct the trade only if a small change would make it valid
         - Remove any trade that cannot be justified
         - Rank and return the **top 3 final trades** (sorted by confidence)
@@ -357,6 +360,20 @@ def simulate_entry(contract, take_profit, stop_loss, confidence):
         if cost > capital:
             print(f"❌ Not enough capital to enter trade on {contract['ticker']}")
             return None
+        
+        # Enforce minimum 12% TP/SL range
+        min_tp = round(entry_price * 1.12, 3)
+        max_sl = round(entry_price * 0.88, 3)
+
+        # Adjust TP if too close
+        if take_profit < min_tp:
+            print(f"⚠️ Adjusting Take Profit from ${take_profit} → ${min_tp}")
+            take_profit = min_tp
+
+        # Adjust SL if too close
+        if stop_loss > max_sl:
+            print(f"⚠️ Adjusting Stop Loss from ${stop_loss} → ${max_sl}")
+            stop_loss = max_sl
 
         trade = {
             "ticker": contract["ticker"],
@@ -375,11 +392,11 @@ def simulate_entry(contract, take_profit, stop_loss, confidence):
         open_trades.append(trade)
         save_state()
 
-        body_text = f"\n🟢 Entered {trade['ticker']} [{trade['type']}] at ${entry_price} (TP: ${take_profit}, SL: ${stop_loss})"
-        print(body_text)
+        body_text = f"🟢 Entered {trade['ticker']} [{trade['type']}] at ${entry_price} (TP: ${take_profit}, SL: ${stop_loss})"
+        print(f"\n{body_text}")
 
         send_alert_via_discord(
-            subject="Exit Alert",
+            subject="Entry Alert",
             body=body_text
         )
         
@@ -431,12 +448,12 @@ def simulate_exit(trade):
             
             print(body_text)
             send_alert_via_discord(
-                subject="Entry Alert",
+                subject="Exit Alert",
                 body=body_text
             )
             return True
         else:
-            print(f"TP/SL not yet reached for {trade['ticker']} [{trade['type']}] (${exit_price}, PnL: ${pnl:.2f}, ROI: {roi:.2f}%). Checking again in 5 minutes...")
+            print(f"TP/SL not yet reached for {trade['ticker']} [{trade['type']}] (${exit_price}, PnL: ${pnl:.2f}, ROI: {roi:.2f}%). Checking again in 5 minutes...\n")
             return True
 
     except Exception as e:
@@ -468,7 +485,7 @@ def load_state():
             open_trades = data["open_trades"]
 
 def run_daily_entry():
-    tickers = random.sample(get_sp500_tickers(), 70)
+    tickers = random.sample(get_sp500_tickers(), 15)
     results = []
 
     print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔍 Evaluating {len(tickers)} tickers...\n")
@@ -512,7 +529,7 @@ def run_daily_entry():
     print(body_text)
     send_alert_via_discord(
         subject="Trade Options For Today",
-        body=body_text
+        body=body_text[:1950]
     )
 
     # Parse and simulate only the top trade
@@ -554,6 +571,11 @@ def run_daily_entry():
         print("❌ No valid top trade block found in GPT output.")
 
 def run_exit_checks():
+    now_et = datetime.now(ET).time()
+    
+    if now_et < dtime(10, 30):  # Before 10:30 ET
+        return  # Don't run early
+
     if is_market_open_now():
         print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⏱️  Checking exits...")
         for trade in open_trades[:]:
@@ -584,9 +606,9 @@ def send_alert_via_discord(
     try:
         response = requests.post(webhook_url, json=payload, timeout=10)
         response.raise_for_status()
-        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 📩 Alert sent to Discord")
+        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 📩 Alert sent to Discord\n")
     except requests.exceptions.RequestException as e:
-        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ❌ Failed to send Discord alert: {e}")
+        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ❌ Failed to send Discord alert: {e}\n")
 
 def is_market_open_now():
     now_et = datetime.now(ET)
@@ -606,7 +628,7 @@ def shutdown(signum, frame):
 def main():
     global capital
     # 1) Log in once at startup
-    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.3\n")
+    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.4\n")
     print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔐 Logging into Robinhood…")
     r.authentication.login(RH_USERNAME, RH_PASSWORD)
     print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ✅ Logged in.")
@@ -617,7 +639,7 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
 
     # Schedule entry at 09:00 ET (08:00 CST)
-    schedule.every().day.at("15:20").do(run_daily_entry)
+    schedule.every().day.at("14:00").do(run_daily_entry) # 10am EST
 
     # Schedule exit checks every 15 minutes
     schedule.every(5).minutes.do(run_exit_checks)
