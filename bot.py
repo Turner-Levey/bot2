@@ -33,7 +33,7 @@ UTC = pytz.utc
 
 today = date.today().strftime("%m/%d/%Y")
 
-INITIAL_CAPITAL = 1000
+INITIAL_CAPITAL = 10000
 SLIPPAGE = 0.01
 MAX_HOLD_DAYS = 10
 LOG_CSV = "gpt_trade_log.csv"
@@ -353,12 +353,12 @@ def simulate_entry(contract, take_profit, stop_loss, confidence):
         if bid > 0 and ask > 0:
             entry_price = round((bid + ask) / 2, 3)
         else:
-            print(f"❌ No valid price available for entry on {contract}")
+            print(f"\n❌ No valid price available for entry on {contract}")
             return None
 
         cost = entry_price * 100 * (1 + SLIPPAGE)
         if cost > capital:
-            print(f"❌ Not enough capital to enter trade on {contract['ticker']}")
+            print(f"\n❌ Not enough capital to enter trade on {contract['ticker']}")
             return None
         
         # Enforce minimum 12% TP/SL range
@@ -623,12 +623,24 @@ def is_market_open_now():
 
 def shutdown(signum, frame):
     print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 👋 Shutting down gracefully…")
+    
+    send_alert_via_discord(
+        subject="Bot Stopped",
+        body=f"🔔 Bot received shutdown signal at {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ET and is exiting."
+    )
+
+    try:
+        r.logout()
+        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔓 Logged out.\n")
+    except Exception:
+        pass
+    
     sys.exit(0)
 
 def main():
     global capital
     # 1) Log in once at startup
-    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.5\n")
+    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.6\n")
     print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔐 Logging into Robinhood…")
     r.authentication.login(RH_USERNAME, RH_PASSWORD)
     print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ✅ Logged in.")
