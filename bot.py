@@ -113,6 +113,7 @@ ENFORCE_RTH = True        # ← set False to allow scans anytime
 MON_FRI_ONLY = True       # weekend guard
 USE_US_HOLIDAYS = True   # requires `pip install holidays`; safe if left False
 MARKET_CLOSE_BUFFER_MIN = 20  # don’t open new trades within this many minutes of close
+_GATE_BLOCKED_REASON = None  # None | "not_market_day" | "after_hours" | "near_close"
 
 # Prefilter debug knobs
 PREFILTER_DEBUG = False
@@ -257,6 +258,17 @@ def append_closed_trade(row_dict):
 def write_recommendations_json(recs):
     with open(RECS_JSON, "w") as f:
         json.dump(recs, f, indent=2, default=str)
+
+def rth_block_reason():
+    """Return a short reason string if scans should be blocked, else None."""
+    now = now_central()
+    if not is_market_day(now):
+        return "not_market_day"
+    if not trading_window_open():
+        return "after_hours"
+    if near_close_buffer():
+        return "near_close"
+    return None
 
 def append_csv_row(path, fieldnames, row):
     safe_mkdir(path)
@@ -1472,9 +1484,24 @@ def run_cycle_selective():
         return
 
     # 3) Scan only during RTH unless explicitly allowed
-    if ENFORCE_RTH and (not trading_window_open() or near_close_buffer()):
-        logger.info("[cycle] Outside trading window or near close → skipping scan.")
-        return
+    if ENFORCE_RTH:
+        global _GATE_BLOCKED_REASON
+        reason = rth_block_reason()
+        if reason is not None:
+            if _GATE_BLOCKED_REASON != reason:
+                # prints once when entering a blocked state (per reason)
+                pretty = {
+                    "not_market_day": "Non-market day",
+                    "after_hours": "Outside trading window",
+                    "near_close": "Within close buffer",
+                }.get(reason, reason)
+                logger.info(f"[cycle] {pretty} → skipping scan.")
+                _GATE_BLOCKED_REASON = reason
+            return
+        else:
+            # cleared: allow future one-time logs if/when we block again
+            if _GATE_BLOCKED_REASON is not None:
+                _GATE_BLOCKED_REASON = None
 
     # 4) Cheap TA prefilter on 1m (with full diagnostics)
     ta_cands, ta_diag = ta_prefilter(
@@ -1548,7 +1575,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.0)…")
+    logger.info("Options Bot starting (V1.0.1)…")
     ensure_rh()
 
     # Ensure state files exist
