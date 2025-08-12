@@ -142,8 +142,8 @@ BREAKOUT_PCT     = 0.002  # need close >= 0.2% above 20-bar high to count as bre
 VOL_SURGE_MULT   = 1.5    # volume confirmation multiplier vs 20-bar avg
 
 # Selective scan thresholds / limits
-TA_SCORE_MIN    = 2.0
-TA_CONF_MIN     = 0.65
+TA_SCORE_MIN    = 1.6
+TA_CONF_MIN     = 0.55
 MAX_AI_EVALS    = 5
 AI_CONF_MIN     = 0.55
 AI_SCORE_MIN    = 1.5
@@ -1575,7 +1575,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.1)…")
+    logger.info("Options Bot starting (V1.0.2)…")
     ensure_rh()
 
     # Ensure state files exist
