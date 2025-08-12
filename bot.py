@@ -1,666 +1,1577 @@
-import yfinance as yf
-import pandas as pd
-from bs4 import BeautifulSoup
-import requests
-import json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Intraday Options Bot — Hybrid TA + AI (paper trading via robin_stocks quotes)
+
+What’s new in this build
+- RTH/market-day gate with a simple toggle (ENFORCE_RTH)
+- Correct CT market close (3:00 PM), weekend/holiday awareness
+- True 1‑minute prefilter + 5‑minute confirm path
+- VWAP resets each session (no multi-day bleed)
+- TA/AI thresholds actually respected
+- AI cooldown + per-cycle cap
+- Post‑TA logging of potential trades (CSV + console)
+- Post‑AI logging of Top 3 (CSV + console)
+- Safer CSV header logic; removed INIT row hack
+- Fixed JSON build (consistent indicators in recco), misc robustness
+
+State files
+- open_trades.json (open state)
+- closed_trades.csv (exits log)
+- last_recommendations.json (latest picks)
+- logs/ta_candidates.csv (TA pass list, appended)
+- logs/ai_top3.csv (Top 3 AI-confirmed per cycle, appended)
+"""
+
 import os
-import re
-import signal
-import sys
-from openai import OpenAI
-from datetime import datetime, timedelta, date, time as dtime  # make sure `date` is imported too
-import pytz
-from tqdm import tqdm
+import json
 import time
-import random
-import robin_stocks.robinhood as r
-import schedule
+import math
+import csv
+import sys
+from datetime import datetime, timedelta, date
+from dateutil import tz, parser as dateparser
 from dotenv import load_dotenv
+from tqdm import tqdm
+import contextlib, builtins
+import logging
+import schedule
 
-# ─────────────────────────────────────────────
-# 1. CONFIGURATION
-# ─────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
-RH_USERNAME = "turnerlevey@verizon.net"
-RH_PASSWORD = "Antideftaphoric$"
+# robin_stocks for quotes (paper)
+import robin_stocks.robinhood as r
 
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-ET = pytz.timezone("US/Eastern")
-UTC = pytz.utc
+# ── AI (optional) ────────────────────────────────────────────────────────────
+USE_AI = True  # set False to disable AI blending
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 
-today = date.today().strftime("%m/%d/%Y")
+try:
+    if USE_AI and OPENAI_API_KEY:
+        from openai import OpenAI
+        _client = OpenAI(api_key=OPENAI_API_KEY)
+    else:
+        _client = None
+except Exception:
+    _client = None
+    USE_AI = False
 
-INITIAL_CAPITAL = 10000
-SLIPPAGE = 0.01
-MAX_HOLD_DAYS = 10
-LOG_CSV = "gpt_trade_log.csv"
-TRADES_FILE = "gpt_open_trades.json"
+# ─────────────────────────────────────────────────────────────────────────────
+# 0) USER SETTINGS
+# ─────────────────────────────────────────────────────────────────────────────
 
+UNIVERSES = {
+    "core30": [
+        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","LLY","V","JPM","UNH","XOM",
+        "JNJ","PG","MA","AVGO","HD","MRK","PEP","ABBV","COST","KO","PFE","ORCL","ADBE","CSCO","NFLX","TMO"
+    ],
+    "liquid100": [
+        # Mega/Tech
+        "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","AMD","CRM","ORCL","INTC","NFLX","MU","SMCI","PLTR",
+        # Cloud/SaaS & Cyber
+        "NOW","SNOW","DDOG","MDB","NET","PANW","CRWD","ZS","OKTA","SHOP","ADBE",
+        # Semis/Hardware
+        "QCOM","AMAT","LRCX","ASML","TSM","TXN","NXPI","ON",
+        # Consumer/Disc/Staples
+        "COST","WMT","HD","LOW","TGT","MCD","SBUX","NKE","LULU","EL","KO","PEP","PG","PM",
+        # Autos & Mobility
+        "GM","F","UBER","ABNB",
+        # Financials/Payments
+        "JPM","BAC","WFC","C","GS","MS","V","MA","AXP","PYPL",
+        # Healthcare/Bio/MedTech
+        "LLY","UNH","MRK","ABBV","JNJ","PFE","TMO","DHR","ISRG","MRNA","BMY","GILD","ZBH",
+        # Energy/Materials
+        "XOM","CVX","COP","SLB","EOG","PSX",
+        # Industrials/Transports
+        "CAT","BA","GE","DE","UPS","FDX","EMR","ETN",
+        # Comm/Media/Other
+        "DIS","CMCSA","SPOT","T","VZ"
+    ],
+    "etfs": ["SPY","QQQ","IWM"]
+}
 
-# ─────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────
-capital = INITIAL_CAPITAL
-open_trades = []
+# Active universe (mix & match)
+TICKERS = UNIVERSES["liquid100"] + UNIVERSES["etfs"]
 
+# Primary (analysis) timeframe kept at 5m for indicator stability
+INTERVAL = "5m"
+PERIOD   = "5d"   # <= 60d for intraday
+TIMEZONE = "America/Chicago"
 
-# ─────────────────────────────────────────────
-# 2. GPT PROMPT FORMATTER
-# ─────────────────────────────────────────────
+# Prefilter scan timeframe (fast & cheap)
+PREFILTER_INTERVAL = "1m"
+PREFILTER_PERIOD   = "1d"
 
-def format_prompt_from_data(data_line, options_data):
-    options_str = f"Top Call Options:\n"
-    for call in options_data["calls"]:
-        options_str += f"- Strike: {call['strike']}, Bid: {call['bid']}, Ask: {call['ask']}, IV: {call['impliedVolatility']}, Vol: {call['volume']}\n"
+# RTH gating / market days
+ENFORCE_RTH = True        # ← set False to allow scans anytime
+MON_FRI_ONLY = True       # weekend guard
+USE_US_HOLIDAYS = True   # requires `pip install holidays`; safe if left False
+MARKET_CLOSE_BUFFER_MIN = 20  # don’t open new trades within this many minutes of close
 
-    options_str += f"\nTop Put Options:\n"
-    for put in options_data["puts"]:
-        options_str += f"- Strike: {put['strike']}, Bid: {put['bid']}, Ask: {put['ask']}, IV: {put['impliedVolatility']}, Vol: {put['volume']}\n"
+# Prefilter debug knobs
+PREFILTER_DEBUG = False
+PREFILTER_DEBUG_PATH = "last_prefilter_debug.json"
 
-    return f"""
-        You are a top-tier financial analyst and options strategist with real-time access to U.S. market data.
+# --- legacy % TP/SL (used as floors if ATR/delta conversion yields too small targets) ---
+TP_PCT = 0.08     # 8% floor for TP (option mark)
+SL_PCT = 0.05     # 5% floor for SL (option mark)
 
-        Today’s date is **{today}**.
+# --- budget & slippage ---
+TOP_N = 5                    # how many candidates to consider/display
+MAX_BUDGET_PER_TRADE = 1000  # hard cap for one contract, in USD
+SLIPPAGE_BUY  = 0.005        # 0.5% buy slippage
+SLIPPAGE_SELL = 0.005        # 0.5% sell slippage (used in PnL calc/logging)
 
-        Your task is to evaluate the stock below and determine whether there is a **high-confidence, directionally biased options trade** to be made today (either a call or a put).
-        You will be working to evaluate a number of stocks every day. This is one of many you will be evaluating today.
+# blending
+TA_WEIGHT = 0.7
+AI_WEIGHT = 0.3
 
-        If no clear opportunity exists based on the technicals, momentum, sentiment, volume, or options pricing, assign a **low confidence score** and do **not** recommend a trade.
+# Indicators
+ATR_WINDOW       = 14
+ADX_WINDOW       = 14
+MIN_ATR_PCT      = 0.5    # require at least 0.5% intraday vol (ATR/Close*100)
+ADX_MIN_TREND    = 20.0   # trend-strength gate
+BREAKOUT_PCT     = 0.002  # need close >= 0.2% above 20-bar high to count as breakout
+VOL_SURGE_MULT   = 1.5    # volume confirmation multiplier vs 20-bar avg
 
-        Only consider strike prices that are near-the-money (within ~5% of the current stock price), unless you clearly justify using a farther OTM strike due to cost, expected volatility, or directional conviction.
+# Selective scan thresholds / limits
+TA_SCORE_MIN    = 2.0
+TA_CONF_MIN     = 0.65
+MAX_AI_EVALS    = 5
+AI_CONF_MIN     = 0.55
+AI_SCORE_MIN    = 1.5
+AI_COOLDOWN_MIN = 30  # don’t re-AI-score same ticker within X minutes
 
-        It is critical for you to take into account that the max holding time for these options is a max of 48 hours. This means that your confidence score and rationale should reflect a relatively quick directional move.
-        
-        ---
+# Contract selection rules ─────────────────────────────────────────────────
+PREFER_3TO5_DTE_THU_FRI = True        # prefer 3–5 DTE when it's Thu/Fri
+DELTA_TARGET_LO = 0.35                # target ~0.35–0.45 delta
+DELTA_TARGET_HI = 0.45
+TARGET_EXPECTED_RETURN_LO = 0.15      # aim 15–25% return for k×ATR favorable move
+TARGET_EXPECTED_RETURN_HI = 0.25
+ATR_K_LIST = [1.0, 1.5, 2.0]          # test 1×, 1.5×, 2× ATR moves
+MAX_STRIKE_CANDIDATES = 20            # strikes to scan around ATM per expiry
 
-        📈 Stock Data:
-        {data_line}
+OPEN_TRADES_JSON = "open_trades.json"
+CLOSED_TRADES_CSV = "closed_trades.csv"
+RECS_JSON = "last_recommendations.json"
 
-        💼 Options Chain (Expiration: {options_data['expiration']}):
-        {options_str}
+# Logging files
+LOG_DIR = "logs"
+TA_LOG_CSV = os.path.join(LOG_DIR, "ta_candidates.csv")
+AI_LOG_CSV = os.path.join(LOG_DIR, "ai_top3.csv")
 
-        ---
+# Robinhood (paper) – quotes only
+RH_USERNAME = os.getenv("RH_USERNAME", "your_email@example.com")
+RH_PASSWORD = os.getenv("RH_PASSWORD", "your_password")
+DO_RH_LOGIN = True  # set True after credentials set
 
-        🎯 Output only in this exact format:
-        Stock: [Ticker]
-        Data Line: [The stock data given above]
-        Options Chain: [The options chain data given above]
-        Direction: [Call or Put or None]
-        Entry Time: [Time or range]
-        Options Contract: [Ticker, strike, expiry, C/P] (or 'None' if no trade)
-        Expiration Date: [MM/DD/YYYY] (or 'None')
-        Entry Price: [$X.XX] (or 'None')
-        Take Profit Target: [$] (or 'None') (This must be higher than the entry price)
-        Stop Loss Threshold: [$] (or 'None') (This must be lower than the entry price)
-        Confidence Score: [0–100]
-        Rationale: [1–3 sentences using the stock’s **technical patterns** (SMA, RSI, volume, ATR), **momentum/sentiment**, and **options pricing characteristics** (IV, spread, volume, IV Rank). You must explicitly reference IV Rank and ATR(14) when evaluating option pricing or likelihood of reaching target. Penalize expensive options when IV Rank is high unless there's a strong breakout setup, and penalize trades with low ATR unless justified.]
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
 
-        ---
-
-        📊 Confidence Score Guidelines:
-        - 90–100: Extremely strong setup (clear technical alignment + volume + sentiment + favorable options pricing)
-        - 75–89: Strong setup with alignment, but some volatility or minor uncertainty
-        - 60–74: Decent opportunity with risks or unclear pricing
-        - 40–59: Mixed indicators or unattractive reward-to-risk
-        - 0–39: Avoid — unclear trend, low volume, poor liquidity, or overpriced contracts
-
-        ⛔ High bid-ask spreads, deep OTM strikes, low volume, or overpriced premiums should reduce the confidence score significantly, even with strong technical setups.
-
-        🔒 Rules & Constraints:
-        - Do not recommend contracts over $10 unless truly exceptional. Justify clearly.
-        - Strike price should be within 5% of the current stock price (i.e., near-the-money) unless the contract is extremely cheap and you clearly explain why it's worth selecting.
-        - Only use options with at least 10 contracts of volume to ensure tradability.
-        - Avoid recommending any contract that is >14 days to expiration from today's date listed above, unless the contract is very cheap and confidence is above 70. In that case, you must explain exactly why the extra time is beneficial.
-        - Be granular and realistic — confidence must vary in single-point increments (e.g., 61, 87).
-        - Avoid clustering between 70–85. Most trades should fall below 70 unless exceptional.
-        - Do not reuse boilerplate language. Make rationale specific to each trade.
-        - If no trade is compelling, say “None” and explain why.
-        - Favor options with tighter bid-ask spreads, decent volume, and fair implied volatility.
-        - Avoid recommending contracts with a very wide spread (>25% of the bid) unless volume is high and price is very low.
-
-        📐 Technical Indicator Guidelines:
-
-        - **RSI**:
-        - RSI > 70 = Overbought (possible reversal or continuation if strong trend)
-        - RSI < 30 = Oversold (possible bounce or continuation if downtrend)
-        - RSI between 30–70 = Neutral
-
-        - **IV Rank**:
-        - > 60 = High → Options are expensive. Penalize long premium trades unless strong breakout potential justifies cost.
-        - < 30 = Low → Options are cheap. Favors long premium directional trades.
-        - 30–60 = Neutral. Consider in context of technicals.
-
-        - **ATR(14)**:
-        - High ATR = High volatility. Good for breakout trades or justifying expensive contracts.
-        - Low ATR = Limited movement. Penalize trades where premium is large relative to likely move.
-
-        ✳️ Confidence Calibration:
-        - Limit 1–2 trades per day above 80.
-        - 2–4 trades in the 70–79 range.
-        - Most trades should fall between 20–60.
-
-        🧠 Think like a trader allocating real capital with real risk and evaluating 100+ setups.
-        """
-
-
-def format_validation_prompt(top5_trades_text, expiration_lookup):
-    expiration_notes = "\n".join(
-        [f"- {ticker}: {exp}" for ticker, exp in expiration_lookup.items()]
-    )
+class TzFormatter(logging.Formatter):
+    def __init__(self, fmt=None, datefmt=None, tzinfo=None):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self.tzinfo = tzinfo or tz.gettz(TIMEZONE)
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, self.tzinfo)
+        return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S %Z")
     
-    return f"""
-        You are an expert options strategist reviewing the top 5 GPT-generated trade recommendations from earlier today.
+class TqdmHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            pass
 
-        Today’s date is **{today}**.
+logger = logging.getLogger("bot")
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
-        The following tickers were analyzed today. You must use the expiration dates exactly as shown here:
+_tqdm = TqdmHandler()
+_tqdm.setLevel(logging.INFO)
+_tqdm.setFormatter(TzFormatter("%(asctime)s %(levelname)s %(message)s"))
 
-        {expiration_notes}
+_stderr = logging.StreamHandler(stream=sys.stderr)
+_stderr.setLevel(logging.ERROR)
+_stderr.setFormatter(TzFormatter("%(asctime)s %(levelname)s %(message)s"))
 
-        Your job is to:
-        - Identify any invalid trades (based on price logic, spread, volume, IV Rank, DTE rules, etc.)
-        - Verify that the confidence score makes sense for a quick (48 hr) hold period
-        - Correct the trade only if a small change would make it valid
-        - Remove any trade that cannot be justified
-        - Rank and return the **top 3 final trades** (sorted by confidence)
+if not logger.handlers:
+    logger.addHandler(_tqdm)
+    logger.addHandler(_stderr)
 
-        Strictly enforce the following rules:
-        - Take profit must be greater than entry price, which must be greater than stop loss
-        - Entry price must be $10 or less
-        - Option must have volume ≥ 10
-        - Bid-ask spread must be < 25% of the bid
-        - No vague rationale — must reference technical indicators and option metrics clearly
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
 
-        Format output like this:
-
-        🧪 Explanation:
-
-        -- [Explain any changes that were made/re-orders that occured, trades that were removed, or if there were no changes necessary when it comes to the top 5 trades and why in 1-3 sentences.]
-
-        📈 Final Top 3 AI Trades (Validated):
-
-        --- Trade #1: [TICKER] (Confidence: X) ---
-        Direction: [Call/Put]
-        Contract: [Symbol, strike, expiry, C/P]
-        Entry Price: $X.XX
-        TP: $X.XX | SL: $X.XX
-        Expiration: [MM/DD/YYYY]
-        Rationale: [1–3 clear, specific sentences]
-
-        [repeat for Trade #2 and Trade #3]
-
-        ---
-
-        If there are no valid trades then say this on the last line: "No valid trades were identified today."
-
-        Here are the top 5 trades for your review:
-
-        {top5_trades_text}
-        """
-
-
-# ─────────────────────────────────────────────
-# 3. GPT CALL
-# ─────────────────────────────────────────────
-
-def ask_gpt_for_trade(prompt):
-    response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
-    return response.choices[0].message.content
-
-# ─────────────────────────────────────────────
-# 4. DATA FUNCTIONS
-# ─────────────────────────────────────────────
-
-def get_sp500_tickers():
-    res = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-    soup = BeautifulSoup(res.text, "html.parser")
-    table = soup.find("table", {"id": "constituents"})
-    return [row.find_all("td")[0].text.strip() for row in table.find_all("tr")[1:]]
-
-def fetch_yahoo_data(ticker):
+@contextlib.contextmanager
+def suppress_robinhood_noise():
+    if os.getenv("RH_VERBOSE") == "1":
+        yield
+        return
+    real_print = builtins.print
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1y")
-        if len(hist) < 20:
-            return None
+        builtins.print = lambda *args, **kwargs: None
+        yield
+    finally:
+        builtins.print = real_print
 
-        price = hist["Close"].iloc[-1]
-        sma10 = hist["Close"].rolling(10).mean().iloc[-1]
-        sma50 = hist["Close"].rolling(50).mean().iloc[-1]
-        sma200 = hist["Close"].rolling(200).mean().iloc[-1] if len(hist) >= 200 else None
-        rsi = compute_rsi(hist["Close"], 14)
-        volume = hist["Volume"].iloc[-1]
-        avg_volume = hist["Volume"].rolling(20).mean().iloc[-1]
+def now_central():
+    return datetime.now(tz.gettz(TIMEZONE))
 
-        hist['H-L'] = hist['High'] - hist['Low']
-        hist['H-PC'] = abs(hist['High'] - hist['Close'].shift(1))
-        hist['L-PC'] = abs(hist['Low'] - hist['Close'].shift(1))
-        tr = hist[['H-L', 'H-PC', 'L-PC']].max(axis=1)
-        atr = tr.rolling(window=14).mean().iloc[-1]
+def safe_mkdir(path: str):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
-        return {
-            "ticker": ticker,
-            "price": round(price, 2),
-            "sma10": round(sma10, 2),
-            "sma50": round(sma50, 2),
-            "sma200": round(sma200, 2) if sma200 else None,
-            "rsi14": round(rsi, 2),
-            "volume": int(volume),
-            "avg_volume": int(avg_volume),
-            "atr14": round(atr, 2),
-        }
-    except:
-        return None
-    
+def read_open_trades():
+    if not os.path.exists(OPEN_TRADES_JSON):
+        return []
+    with open(OPEN_TRADES_JSON, "r") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return []
 
-def fetch_options_chain(ticker):
-    stock = yf.Ticker(ticker)
-    try:
-        expirations = stock.options
-        if not expirations:
-            return None
+def write_open_trades(trades):
+    safe_mkdir(OPEN_TRADES_JSON)
+    with open(OPEN_TRADES_JSON, "w") as f:
+        json.dump(trades, f, indent=2, default=str)
 
-        # Filter expirations to only those between 3 and 14 days from today
-        today_dt = datetime.today().date()
-        valid_exps = [
-            exp for exp in expirations
-            if 3 <= (datetime.strptime(exp, "%Y-%m-%d").date() - today_dt).days <= 14
-        ]
-
-        if not valid_exps:
-            return None  # No valid DTE found
-
-        nearest_exp = valid_exps[0]
-        opt_chain = stock.option_chain(nearest_exp)
-        calls = opt_chain.calls[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'impliedVolatility']]
-        puts = opt_chain.puts[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'impliedVolatility']]
-        top_calls = calls.sort_values(by='volume', ascending=False).head(3)
-        top_puts = puts.sort_values(by='volume', ascending=False).head(3)
-
-        ivs = list(top_calls['impliedVolatility'].dropna()) + list(top_puts['impliedVolatility'].dropna())
-        if len(ivs) < 2:
-            iv_rank = None
-        else:
-            current_iv = sum(ivs) / len(ivs)
-            iv_rank = round((current_iv - min(ivs)) / (max(ivs) - min(ivs)) * 100, 1) if max(ivs) > min(ivs) else 0.0
-
-        return {
-            "expiration": nearest_exp,
-            "calls": top_calls.to_dict(orient='records'),
-            "puts": top_puts.to_dict(orient='records'),
-            "iv_rank": iv_rank
-        }
-    except Exception as e:
-        print(f"❌ Error fetching chain for {ticker}: {e}")
-        return None
-    
-
-def compute_rsi(series, period):
-    delta = series.diff().dropna()
-    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs)).iloc[-1]
-
-# ─────────────────────────────────────────────
-# 5. CONFIDENCE PARSER
-# ─────────────────────────────────────────────
-
-def extract_confidence_score(text):
-    match = re.search(r"Confidence Score:\s*(\d+)", text)
-    return int(match.group(1)) if match else 0
-
-# ─────────────────────────────────────────────
-# 6. MAIN LOOP
-# ─────────────────────────────────────────────
-
-def simulate_entry(contract, take_profit, stop_loss, confidence):
-    global capital
-
-    try:
-        # Fetch option instruments from Robinhood
-        options = r.options.find_options_by_expiration_and_strike(
-            contract["ticker"],
-            contract["expiry"],
-            str(contract["strike"]),
-            optionType="call" if contract["type"] == "C" else "put"
-        )
-
-        if not options:
-            print(f"❌ No Robinhood options found for {contract}")
-            return None
-
-        option_id = options[0]["id"]
-
-        # Get market data
-        market_data = r.options.get_option_market_data_by_id(option_id)
-        if not market_data:
-            print(f"❌ No market data for {option_id}")
-            return None
-
-        market = market_data[0]
-        bid = float(market.get("bid_price") or 0)
-        ask = float(market.get("ask_price") or 0)
-
-        # Entry price fallback logic: midpoint > bid/ask avg > last
-        if bid > 0 and ask > 0:
-            entry_price = round((bid + ask) / 2, 3)
-        else:
-            print(f"\n❌ No valid price available for entry on {contract}")
-            return None
-
-        cost = entry_price * 100 * (1 + SLIPPAGE)
-        if cost > capital:
-            print(f"\n❌ Not enough capital to enter trade on {contract['ticker']}")
-            return None
-        
-        # Enforce minimum 12% TP/SL range
-        min_tp = round(entry_price * 1.12, 3)
-        max_sl = round(entry_price * 0.88, 3)
-
-        # Adjust TP if too close
-        if take_profit < min_tp:
-            print(f"⚠️ Adjusting Take Profit from ${take_profit} → ${min_tp}")
-            take_profit = min_tp
-
-        # Adjust SL if too close
-        if stop_loss > max_sl:
-            print(f"⚠️ Adjusting Stop Loss from ${stop_loss} → ${max_sl}")
-            stop_loss = max_sl
-
-        trade = {
-            "ticker": contract["ticker"],
-            "type": contract["type"],  # 'C' or 'P'
-            "strike": contract["strike"],
-            "expiry": contract["expiry"],
-            "entry_price": entry_price,
-            "take_profit": take_profit,
-            "stop_loss": stop_loss,
-            "entry_time": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
-            "confidence": confidence,
-            "status": "OPEN"
-        }
-
-        capital -= cost
-        open_trades.append(trade)
-        save_state()
-
-        body_text = f"🟢 Entered {trade['ticker']} [{trade['type']}] at ${entry_price} (TP: ${take_profit}, SL: ${stop_loss})"
-        print(f"\n{body_text}")
-
-        send_alert_via_discord(
-            subject="Entry Alert",
-            body=body_text
-        )
-        
-        return trade
-
-    except Exception as e:
-        print(f"❌ simulate_entry failed for {contract['ticker']}: {e}")
-        return None
-
-def simulate_exit(trade):
-    global capital
-    ticker = trade["ticker"]
-    try:
-        options = r.options.find_options_by_expiration_and_strike(
-            ticker, trade["expiry"], str(trade["strike"]), optionType="call" if trade["type"] == "C" else "put"
-        )
-        if not options:
-            return False
-
-        opt = options[0]
-        market = r.options.get_option_market_data_by_id(opt["id"])[0]
-        bid = float(market.get("bid_price") or 0)
-        ask = float(market.get("ask_price") or 0)
-        mid = (bid + ask) / 2
-
-        exit_price = mid * (1 - SLIPPAGE) if trade["type"] == "C" else mid * (1 + SLIPPAGE)
-        entry = trade["entry_price"]
-        pnl = (exit_price - entry) * 100
-        roi = (pnl / (entry * 100)) * 100
-
-        if (
-            exit_price >= trade["take_profit"]
-            or exit_price <= trade["stop_loss"]
-            or datetime.strptime(trade["expiry"], "%Y-%m-%d").date() <= datetime.now(ET).date()
-        ):
-            trade.update({
-                "exit_price": round(exit_price, 3),
-                "exit_time": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
-                "pnl": round(pnl, 2),
-                "roi": round(roi, 2),
-                "status": "CLOSED"
-            })
-            capital += exit_price * 100
-            open_trades.remove(trade)
-            log_trade(trade)
-            save_state()
-
-            body_text = f"🔴 Exited {trade['ticker']} [{trade['type']}] | PnL: ${pnl:.2f} | ROI: {roi:.2f}%"
-            
-            print(body_text)
-            send_alert_via_discord(
-                subject="Exit Alert",
-                body=body_text
-            )
-            return True
-        else:
-            print(f"TP/SL not yet reached for {trade['ticker']} [{trade['type']}] (${exit_price}, PnL: ${pnl:.2f}, ROI: {roi:.2f}%). Checking again in 5 minutes...\n")
-            return True
-
-    except Exception as e:
-        print(f"❌ Failed exit for {ticker}: {e}")
-    return False
-
-def log_trade(trade):
-    import csv
-    file_exists = os.path.exists(LOG_CSV)
-    with open(LOG_CSV, mode="a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=trade.keys())
-        if not file_exists:
+def append_closed_trade(row_dict):
+    safe_mkdir(CLOSED_TRADES_CSV)
+    exists = os.path.exists(CLOSED_TRADES_CSV)
+    with open(CLOSED_TRADES_CSV, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
+        if not exists:
             writer.writeheader()
-        writer.writerow(trade)
+        writer.writerow(row_dict)
 
-def save_state():
-    with open(TRADES_FILE, "w") as f:
-        json.dump({
-            "capital": capital,
-            "open_trades": open_trades
-        }, f, indent=2)
+def write_recommendations_json(recs):
+    with open(RECS_JSON, "w") as f:
+        json.dump(recs, f, indent=2, default=str)
 
-def load_state():
-    global capital, open_trades
-    if os.path.exists(TRADES_FILE):
-        with open(TRADES_FILE, "r") as f:
-            data = json.load(f)
-            capital = data["capital"]
-            open_trades = data["open_trades"]
+def append_csv_row(path, fieldnames, row):
+    safe_mkdir(path)
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
 
-def run_daily_entry():
-    tickers = random.sample(get_sp500_tickers(), 70)
-    results = []
+# Market day / hours helpers
 
-    print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔍 Evaluating {len(tickers)} tickers...\n")
+def is_market_day(dt):
+    if MON_FRI_ONLY and dt.weekday() >= 5:
+        return False
+    if USE_US_HOLIDAYS:
+        try:
+            import holidays
+            us_holidays = holidays.UnitedStates()
+            if dt.date() in us_holidays:
+                return False
+        except Exception:
+            pass
+    return True
 
-    for t in tqdm(tickers, desc="📊 Analyzing"):
-        d = fetch_yahoo_data(t)
-        options = fetch_options_chain(t)
+# Trading window & AI cooldown
+_last_ai_eval = {}  # {ticker: datetime}
 
-        if not d or not options or isinstance(options, str):
-            tqdm.write(f"❌ Skipping {t} (data or options missing)")
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) TECHNICALS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute EMA, RSI, MACD, VWAP (session-reset), ATR(ewm), ADX(ewm)."""
+    out = df.copy()
+
+    # Flatten any (n,1) frames into Series
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in out.columns and isinstance(out[col], pd.DataFrame):
+            out[col] = out[col].iloc[:, 0]
+        else:
+            out[col] = pd.Series(out[col].values, index=out.index)
+
+    # EMA
+    out["EMA9"]  = out["Close"].ewm(span=9,  adjust=False).mean()
+    out["EMA21"] = out["Close"].ewm(span=21, adjust=False).mean()
+
+    # RSI(14)
+    delta = out["Close"].diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=out.index).ewm(span=14, adjust=False).mean()
+    roll_down = pd.Series(down, index=out.index).ewm(span=14, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    out["RSI14"] = 100.0 - (100.0 / (1.0 + rs))
+
+    # MACD
+    ema12 = out["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = out["Close"].ewm(span=26, adjust=False).mean()
+    out["MACD"] = ema12 - ema26
+    out["MACD_Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
+    out["MACD_Hist"] = out["MACD"] - out["MACD_Signal"]
+
+    # VWAP (reset each session)
+    tp = (out["High"] + out["Low"] + out["Close"]) / 3.0
+    cum_vol = out["Volume"].groupby(out.index.date).cumsum().replace(0, np.nan)
+    cum_tp_vol = (tp * out["Volume"]).groupby(out.index.date).cumsum()
+    out["VWAP"] = cum_tp_vol / cum_vol
+
+    # Rolling high/low & avg volume
+    out["DayHigh20"] = out["High"].rolling(20).max()
+    out["DayLow20"]  = out["Low"].rolling(20).min()
+    out["VolMA20"]   = out["Volume"].rolling(20).mean()
+
+    # ATR (EWMA of True Range)
+    hl   = out["High"] - out["Low"]
+    h_pc = (out["High"] - out["Close"].shift(1)).abs()
+    l_pc = (out["Low"]  - out["Close"].shift(1)).abs()
+    tr = pd.concat([hl, h_pc, l_pc], axis=1).max(axis=1)
+    out["ATR"] = tr.ewm(span=ATR_WINDOW, adjust=False).mean()
+
+    # ADX (EWMA variant)
+    up_move   = out["High"].diff()
+    down_move = -out["Low"].diff()
+    plus_dm  = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr_ewm   = tr.ewm(span=ADX_WINDOW, adjust=False).mean()
+    plus_di  = 100 * (pd.Series(plus_dm,  index=out.index).ewm(span=ADX_WINDOW, adjust=False).mean() / (tr_ewm + 1e-9))
+    minus_di = 100 * (pd.Series(minus_dm, index=out.index).ewm(span=ADX_WINDOW, adjust=False).mean() / (tr_ewm + 1e-9))
+    dx = 100 * (plus_di.subtract(minus_di).abs() / (plus_di + minus_di + 1e-9))
+    out["ADX"] = dx.ewm(span=ADX_WINDOW, adjust=False).mean()
+
+    return out
+
+
+def evaluate_signal_ta(df: pd.DataFrame) -> dict:
+    """Score the most recent bar using pure TA with safe scalar extraction."""
+    if df is None or df.empty:
+        return {"ta_score": 0.0, "ta_direction": "PUT", "ta_confidence": 0.0, "ta_reasons": ["no data"]}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
+
+    def val(row, name):
+        v = row[name]
+        try:
+            return float(v) if pd.notna(v) else np.nan
+        except Exception:
+            return np.nan
+
+    ema9, ema21 = val(last, "EMA9"), val(last, "EMA21")
+    rsi = val(last, "RSI14")
+    macd, macd_sig = val(last, "MACD"), val(last, "MACD_Signal")
+    macd_prev, macd_sig_prev = val(prev, "MACD"), val(prev, "MACD_Signal")
+    vwap = val(last, "VWAP")
+    close_, prev_close = val(last, "Close"), val(prev, "Close")
+    day_hi20, day_lo20 = val(last, "DayHigh20"), val(last, "DayLow20")
+    vol, volma20 = val(last, "Volume"), val(last, "VolMA20")
+    atr = val(last, "ATR")
+    adx = val(last, "ADX")
+
+    score = 0.0
+    reasons = []
+
+    # Volatility & trend-strength gates
+    atr_pct = (atr / close_ * 100.0) if (pd.notna(atr) and pd.notna(close_) and close_ > 0) else np.nan
+    vol_ok = pd.notna(atr_pct) and atr_pct >= MIN_ATR_PCT
+    adx_ok = pd.notna(adx) and adx >= ADX_MIN_TREND
+
+    if vol_ok: reasons.append(f"ATR% {atr_pct:.2f} ≥ {MIN_ATR_PCT:.2f} (vol OK)")
+    else:      reasons.append(f"ATR% {atr_pct:.2f} < {MIN_ATR_PCT:.2f} (low vol; trend bonuses reduced)")
+    if adx_ok: reasons.append(f"ADX {adx:.1f} ≥ {ADX_MIN_TREND:.0f} (trend OK)")
+    else:      reasons.append(f"ADX {adx:.1f} < {ADX_MIN_TREND:.0f} (weak trend; trend bonuses reduced)")
+
+    # EMA trend (weight by gates)
+    ema_weight = 1.0 if (vol_ok and adx_ok) else 0.3
+    if pd.notna(ema9) and pd.notna(ema21):
+        if ema9 > ema21:
+            score += 1.0 * ema_weight; reasons.append(f"EMA9>EMA21 (bullish){' [reduced]' if ema_weight<1 else ''}")
+        elif ema9 < ema21:
+            score -= 1.0 * ema_weight; reasons.append(f"EMA9<EMA21 (bearish){' [reduced]' if ema_weight<1 else ''}")
+
+    # RSI
+    if pd.notna(rsi):
+        if 55 <= rsi < 65:
+            score += 0.6; reasons.append("RSI 55–65 (bullish momentum)")
+        elif 65 <= rsi < 70:
+            score += 0.15; reasons.append("RSI 65–70 (momentum waning)")
+        elif rsi >= 70:
+            score -= 0.5; reasons.append("RSI ≥70 (overbought risk)")
+        elif 45 <= rsi < 55:
+            reasons.append("RSI 45–55 (neutral)")
+        elif 30 <= rsi < 45:
+            score -= 0.6; reasons.append("RSI 30–45 (bearish momentum)")
+        elif rsi < 30:
+            score += 0.3; reasons.append("RSI <30 (oversold risk/bounce)")
+
+    # MACD
+    if pd.notna(macd) and pd.notna(macd_sig) and pd.notna(macd_prev) and pd.notna(macd_sig_prev):
+        if macd > macd_sig and macd_prev <= macd_sig_prev:
+            score += 0.8; reasons.append("Fresh MACD bull cross")
+        elif macd < macd_sig and macd_prev >= macd_sig_prev:
+            score -= 0.8; reasons.append("Fresh MACD bear cross")
+        else:
+            score += 0.2 if macd > macd_sig else (-0.2 if macd < macd_sig else 0)
+
+    # VWAP
+    if pd.notna(close_) and pd.notna(vwap):
+        if close_ > vwap: score += 0.3; reasons.append("Above VWAP")
+        elif close_ < vwap: score -= 0.3; reasons.append("Below VWAP")
+
+    # Breakout / breakdown with confirmation
+    if pd.notna(close_) and pd.notna(day_hi20) and pd.notna(vol) and pd.notna(volma20) and volma20 > 0:
+        if close_ >= day_hi20 * (1.0 + BREAKOUT_PCT) and vol > VOL_SURGE_MULT * volma20 and vol_ok and adx_ok:
+            score += 0.6; reasons.append(f"Confirmed breakout (+{BREAKOUT_PCT*100:.1f}% & vol>{VOL_SURGE_MULT}×)")
+        if pd.notna(day_lo20) and close_ <= day_lo20 * (1.0 - BREAKOUT_PCT) and vol > VOL_SURGE_MULT * volma20 and vol_ok and adx_ok:
+            score -= 0.6; reasons.append(f"Confirmed breakdown (−{BREAKOUT_PCT*100:.1f}% & vol>{VOL_SURGE_MULT}×)")
+
+    # Volume surge
+    if pd.notna(vol) and pd.notna(volma20) and volma20 > 0:
+        if vol > 1.5 * volma20 and pd.notna(prev_close):
+            if close_ > prev_close: score += 0.4; reasons.append("Bullish volume surge")
+            elif close_ < prev_close: score -= 0.4; reasons.append("Bearish volume surge")
+
+    ta_direction = "CALL" if score > 0 else "PUT"
+    ta_confidence = round(min(1.0, abs(score) / 3.2), 2)
+    return {"ta_score": round(score, 2), "ta_direction": ta_direction, "ta_confidence": ta_confidence, "ta_reasons": reasons}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) AI OVERLAY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ask_gpt_for_hybrid_score(ticker: str, df_ta: pd.DataFrame) -> dict:
+    """Return {ai_direction, ai_confidence (0..1), rationale, risk_notes} or empty on failure."""
+    if not USE_AI or _client is None:
+        return {}
+    last = df_ta.iloc[-1]
+    prev = df_ta.iloc[-2] if len(df_ta) >= 2 else last
+    context = {
+        "ticker": ticker,
+        "timestamp": df_ta.index[-1].isoformat(),
+        "close": round(float(last["Close"]), 4),
+        "ema9": round(float(last["EMA9"]), 4),
+        "ema21": round(float(last["EMA21"]), 4),
+        "rsi14": round(float(last["RSI14"]), 2),
+        "macd": round(float(last["MACD"]), 4),
+        "macd_signal": round(float(last["MACD_Signal"]), 4),
+        "macd_hist": round(float(last["MACD_Hist"]), 4),
+        "vwap": round(float(last["VWAP"]), 4),
+        "day_high20": round(float(last["DayHigh20"]), 4),
+        "day_low20": round(float(last["DayLow20"]), 4),
+        "volume": int(last["Volume"]),
+        "volma20": None if pd.isna(last["VolMA20"]) else int(last["VolMA20"]),
+        "prev_close": round(float(prev["Close"]), 4),
+    }
+    system = (
+        "You are a disciplined intraday trading analyst. "
+        "Use only the structured indicator data to assess the next ~2 hours trend bias. "
+        "No news or external context. Output strict JSON with fields: "
+        "{ai_direction: 'CALL'|'PUT', ai_confidence: number 0..1, rationale: short string, risk_notes: short string}."
+    )
+    user = (
+        "Given this 1–5 minute indicator snapshot (intraday), choose CALL if bias is up, PUT if down. "
+        "Confidence should reflect strength and alignment of signals. Be conservative when signals conflict.\n\n"
+        f"{json.dumps(context)}"
+    )
+    try:
+        resp = _client.chat.completions.create(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system},{"role": "user", "content": user}],
+        )
+        content = resp.choices[0].message.content
+        data = json.loads(content)
+        ai_dir = str(data.get("ai_direction", "")).upper()
+        if ai_dir not in ("CALL", "PUT"):
+            return {}
+        ai_conf = data.get("ai_confidence", None)
+        try:
+            ai_conf = float(ai_conf)
+        except Exception:
+            ai_conf = None
+        if ai_conf is None or math.isnan(ai_conf):
+            return {}
+        ai_conf = max(0.0, min(1.0, ai_conf))
+        return {
+            "ai_direction": ai_dir,
+            "ai_confidence": round(ai_conf, 2),
+            "rationale": data.get("rationale", ""),
+            "risk_notes": data.get("risk_notes", "")
+        }
+    except Exception:
+        return {}
+
+
+def blend_scores(ta_dir: str, ta_score: float, ta_conf: float, ai: dict) -> dict:
+    """Blend TA and AI into final direction & score."""
+    if not ai:
+        return {"direction": ta_dir, "score": round(float(ta_score), 2), "confidence": round(float(ta_conf), 2), "blend_notes": "TA-only (AI unavailable)"}
+    def sign(d): return 1 if d == "CALL" else -1
+    ta_component = TA_WEIGHT * ta_score
+    ai_component = AI_WEIGHT * (sign(ai["ai_direction"]) * 3.2 * ai["ai_confidence"])  # 3.2 ≈ TA scale
+    blended = ta_component + ai_component
+    direction = "CALL" if blended > 0 else "PUT"
+    confidence = min(1.0, abs(blended) / 3.2)
+    return {"direction": direction, "score": round(float(blended), 2), "confidence": round(float(confidence), 2), "blend_notes": f"blend TA({TA_WEIGHT}) + AI({AI_WEIGHT})"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) DATA & PREFILTER / CONFIRM
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fix_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns and isinstance(df[col], pd.DataFrame):
+            df[col] = df[col].iloc[:, 0]
+    return df
+
+
+def fetch_5m_df(ticker: str, latest_session_only: bool = True) -> pd.DataFrame:
+    df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False, prepost=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = _fix_df_columns(df)
+    local_tz = tz.gettz(TIMEZONE)
+    if df.index.tz is None:
+        df = df.tz_localize("UTC").tz_convert(local_tz)
+    else:
+        df = df.tz_convert(local_tz)
+    if latest_session_only:
+        last_session = df.index[-1].date()
+        df = df[df.index.date == last_session]
+    return df
+
+
+def fetch_1m_today(ticker: str) -> pd.DataFrame:
+    df = yf.download(ticker, period=PREFILTER_PERIOD, interval=PREFILTER_INTERVAL, progress=False, auto_adjust=False, prepost=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = _fix_df_columns(df)
+    local_tz = tz.gettz(TIMEZONE)
+    if df.index.tz is None:
+        df = df.tz_localize("UTC").tz_convert(local_tz)
+    else:
+        df = df.tz_convert(local_tz)
+    return df[df.index.date == now_central().date()]
+
+
+def ta_prefilter(
+    tickers,
+    min_conf: float = 0.50,
+    min_abs_score: float = 1.00,
+    return_all: bool = False,
+):
+    diagnostics = []
+    qualified = []
+
+    for t in tickers:
+        try:
+            # Try true 1m today; fallback to 5m latest session if not enough bars
+            df1 = fetch_1m_today(t)
+            use_df = df1 if len(df1) >= 50 else fetch_5m_df(t, latest_session_only=True)
+            if use_df is None or use_df.empty or len(use_df) < 50:  # require some history
+                diagnostics.append({"ticker": t, "error": "no/insufficient bars", "pass": False})
+                continue
+
+            df_ta_full = compute_indicators(use_df)
+
+            # Use the last available bar (today if present, otherwise last)
+            today = now_central().date()
+            df_today = df_ta_full[df_ta_full.index.date == today]
+            row = df_today.iloc[-1] if len(df_today) else df_ta_full.iloc[-1]
+
+            # Give evaluate_signal_ta a recent slice
+            end_ts = row.name
+            df_slice = df_ta_full.loc[:end_ts].tail(300)
+            ta = evaluate_signal_ta(df_slice)
+
+            def _num(x):
+                try:
+                    v = float(x)
+                    return v if np.isfinite(v) else None
+                except Exception:
+                    return None
+
+            close = _num(row.get("Close"))
+            atr   = _num(row.get("ATR"))
+            adx   = _num(row.get("ADX"))
+            atr_pct = (atr / close * 100.0) if (atr is not None and close and close > 0) else None
+            vol_ok = (atr_pct is not None and atr_pct >= MIN_ATR_PCT)
+            adx_ok = (adx is not None and adx >= ADX_MIN_TREND)
+
+            di = {
+                "ticker": t,
+                "ta_score": ta.get("ta_score"),
+                "ta_confidence": ta.get("ta_confidence"),
+                "ta_direction": ta.get("ta_direction"),
+                "ta_reasons": ta.get("ta_reasons", []),
+                "bars": int(len(df_slice)),
+                "last": {
+                    "close": close,
+                    "ema9": _num(row.get("EMA9")),
+                    "ema21": _num(row.get("EMA21")),
+                    "rsi14": _num(row.get("RSI14")),
+                    "macd": _num(row.get("MACD")),
+                    "macd_signal": _num(row.get("MACD_Signal")),
+                    "vwap": _num(row.get("VWAP")),
+                    "atr": atr,
+                    "adx": adx,
+                    "atr_pct": (round(atr_pct, 3) if atr_pct is not None else None),
+                    "vol_ok": vol_ok,
+                    "adx_ok": adx_ok,
+                    "volume": int(row.get("Volume") or 0),
+                },
+            }
+
+            passed = (
+                di["ta_score"] is not None and
+                di["ta_confidence"] is not None and
+                abs(float(di["ta_score"])) >= float(min_abs_score) and
+                float(di["ta_confidence"]) >= float(min_conf)
+            )
+            di["pass"] = bool(passed)
+            diagnostics.append(di)
+
+            if passed:
+                qualified.append({
+                    "ticker": t,
+                    "ta_score": di["ta_score"],
+                    "ta_confidence": di["ta_confidence"],
+                    "ta_direction": di["ta_direction"],
+                    "ta": ta,
+                    "df_ta": df_slice,  # for AI
+                })
+
+        except Exception as e:
+            diagnostics.append({"ticker": t, "error": f"{e}", "pass": False})
             continue
 
-        data_line = (
-            f"{d['ticker']} | Price: ${d['price']} | SMA10: {d['sma10']} | SMA50: {d['sma50']} | "
-            f"SMA200: {d['sma200']} | RSI14: {d['rsi14']} | Vol: {d['volume']} | AvgVol: {d['avg_volume']} | "
-            f"IV Rank: {options['iv_rank']} | ATR(14): {d['atr14']}"
-        )
-
-        prompt = format_prompt_from_data(data_line, options)
-        result = ask_gpt_for_trade(prompt)
-
-        confidence = extract_confidence_score(result)
-        results.append({"ticker": d["ticker"], "text": result, "confidence": confidence})
-
-    sorted_trades = sorted(results, key=lambda x: x["confidence"], reverse=True)
-    print("\n📋 All AI Trade Ideas (Sorted by Confidence):\n")
-    for i, trade in enumerate(sorted_trades, 1):
-        print(f"--- Trade #{i}: {trade['ticker']} (Confidence: {trade['confidence']}) ---\n{trade['text']}\n")
-
-    expiration_lookup = {t["ticker"]: options["expiration"] for t in sorted_trades[:5]}
-
-    # Take top 5 trades and combine their text
-    top5_text = "\n\n".join([t["text"] for t in sorted_trades[:5]])
-    validation_prompt = format_validation_prompt(top5_text, expiration_lookup)
-
-    # Ask GPT to validate and refine top 5 into top 3
-    final_output = ask_gpt_for_trade(validation_prompt)
-
-    body_text = f"🧠 Post-Validation Final Top 3 Trades:\n\n{final_output}"
-            
-    print(body_text)
-    send_alert_via_discord(
-        subject="Trade Options For Today",
-        body=body_text[:1950]
+    diagnostics_sorted = sorted(
+        diagnostics,
+        key=lambda x: (abs(x.get("ta_score") or 0.0), x.get("ta_confidence") or 0.0),
+        reverse=True,
     )
 
-    # Parse and simulate only the top trade
-    top_trade_block = final_output.split("--- Trade #1:")[1] if "--- Trade #1:" in final_output else None
-
-    if top_trade_block:
+    if PREFILTER_DEBUG:
         try:
-            lines = top_trade_block.strip().splitlines()
-            ticker = lines[0].split()[0].strip()
-            confidence = int(re.search(r"Confidence:\s*(\d+)", top_trade_block).group(1))
-            direction = re.search(r"Direction:\s*(Call|Put)", top_trade_block).group(1)
-            cp = 'C' if direction == "Call" else 'P'
+            with open(PREFILTER_DEBUG_PATH, "w") as f:
+                json.dump(diagnostics_sorted, f, indent=2, default=str)
+        except Exception:
+            pass
 
-            contract_match = re.search(r"Contract:\s*([\w\d\-\.]+),\s*([\d\.]+),\s*([\d\-]+),\s*(C|P)", top_trade_block)
-            if contract_match:
-                _, strike, expiry, _ = contract_match.groups()
-                strike = float(strike)
+    return (qualified, diagnostics_sorted) if return_all else qualified
 
-                if expiry != expiration_lookup.get(ticker):
-                    print(f"⚠️ GPT changed expiration from {expiration_lookup[ticker]} to {expiry} — using original.")
-                    expiry = expiration_lookup.get(ticker)
 
-                tp = float(re.search(r"TP:\s*\$(\d+\.\d+)", top_trade_block).group(1))
-                sl = float(re.search(r"SL:\s*\$(\d+\.\d+)", top_trade_block).group(1))
+# Simple Robinhood expirations cache to reduce calls
+_EXP_CACHE = {"data": {}, "ts": {}}  # symbol -> list[str]; ts for freshness
+_EXP_CACHE_TTL_SEC = 1800  # 30 minutes
 
-                contract = {
-                    "ticker": ticker,
-                    "strike": strike,
-                    "expiry": expiry,
-                    "type": cp
-                }
 
-                simulate_entry(contract, tp, sl, confidence)
-            else:
-                print("❌ Could not extract contract line from top trade block.")
-        except Exception as e:
-            print(f"❌ Error parsing/simulating top trade: {e}")
-    else:
-        print("❌ No valid top trade block found in GPT output.")
-
-def run_exit_checks():
-    now_et = datetime.now(ET).time()
-    
-    if now_et < dtime(10, 30):  # Before 10:30 ET
-        return  # Don't run early
-
-    if is_market_open_now():
-        print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⏱️  Checking exits...")
-        for trade in open_trades[:]:
-            simulate_exit(trade)
-
-        if len(open_trades) == 0:
-            print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 💤 No open trades to close.\n")
-
-def send_alert_via_discord(
-    subject: str,
-    body: str,
-    webhook_url: str = "https://discord.com/api/webhooks/1380608363754295316/rHD8hZVAetkCM5Is8w8-BwXtrmuh23Shi8GAY8DJJ0Q4SFVgBRAjlkmEmUvhUyySMrue"  # Replace with your webhook URL
-):
-    """
-    Send an alert message to a Discord channel via webhook.
-    - recipients: Optional, used just for logging who the alert is for.
-    - subject: Title or prefix for the alert.
-    - body: Message body.
-    - webhook_url: Discord webhook URL.
-    """
-
-    content = f"📢 **{subject}**\n\n{body}\n\u200B\n"
-    payload = {
-        "username": "Alert Bot",
-        "content": content
-    }
-
+def _all_future_expirations(symbol: str) -> list[str]:
+    """Cached full future expirations list (yyyy-mm-dd) for a symbol."""
     try:
-        response = requests.post(webhook_url, json=payload, timeout=10)
-        response.raise_for_status()
-        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 📩 Alert sent to Discord\n")
-    except requests.exceptions.RequestException as e:
-        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ❌ Failed to send Discord alert: {e}\n")
+        now_ts = time.time()
+        cache_ok = symbol in _EXP_CACHE["data"] and (now_ts - _EXP_CACHE["ts"].get(symbol, 0)) < _EXP_CACHE_TTL_SEC
+        if cache_ok:
+            return _EXP_CACHE["data"][symbol]
 
-def is_market_open_now():
-    now_et = datetime.now(ET)
-    is_weekday = now_et.weekday() < 5  # 0 = Monday, 4 = Friday
-    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    return is_weekday and market_open <= now_et <= market_close
-   
-# ─────────────────────────────────────────────
-# 7. STARTUP
-# ─────────────────────────────────────────────
+        with suppress_robinhood_noise():
+            all_opts = r.options.find_tradable_options(symbol) or []
+        if not all_opts:
+            return []
+        today = now_central().date()
+        exps = set()
+        for o in all_opts:
+            e = o.get("expiration_date")
+            if not e:
+                continue
+            try:
+                dt = dateparser.parse(e).date()
+                if dt >= today:
+                    exps.add(e)
+            except Exception:
+                continue
+        ordered = sorted(exps, key=lambda s: dateparser.parse(s).date())
+        _EXP_CACHE["data"][symbol] = ordered
+        _EXP_CACHE["ts"][symbol] = now_ts
+        return ordered
+    except Exception:
+        return []
 
-def shutdown(signum, frame):
-    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 👋 Shutting down gracefully…")
-    
-    send_alert_via_discord(
-        subject="Bot Stopped",
-        body=f"🔔 Bot received shutdown signal at {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ET and is exiting."
+def choose_sensible_expirations(symbol: str, max_to_try: int = 6) -> list[str]:
+    """
+    Prefer 3–5 DTE when it's Thu/Fri; else Friday-first ordering.
+    Fallback to earliest future expiries.
+    """
+    exps = _all_future_expirations(symbol)
+    if not exps:
+        return []
+
+    today = now_central().date()
+    wkday = today.weekday()  # Mon=0 ... Sun=6
+    if PREFER_3TO5_DTE_THU_FRI and wkday in (3, 4):  # Thu or Fri
+        # Filter expiries with DTE in [3..5]
+        dte_3to5 = []
+        others = []
+        for e in exps:
+            dte = (dateparser.parse(e).date() - today).days
+            (dte_3to5 if 3 <= dte <= 5 else others).append(e)
+        if dte_3to5:
+            return dte_3to5[:max_to_try]
+        # else fall through to normal ordering below
+
+    # Friday-first default
+    fridays = [e for e in exps if dateparser.parse(e).date().weekday() == 4]
+    others  = [e for e in exps if e not in fridays]
+    ordered = fridays + others
+    return ordered[:max_to_try]
+
+def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
+    """
+    Given prefiltered TA candidates (dicts that at least contain {"ticker"}),
+    recompute TA here on 5m, run AI on the top_k by TA strength, and return the
+    confirmed list sorted by blended confidence then abs(score).
+    """
+    if not USE_AI or _client is None:
+        return []  # AI disabled → no confirmations
+
+    if not cands:
+        return []
+
+    # Rank by TA strength if available; otherwise keep input order
+    def _ta_key(c):
+        return (abs(c.get("ta_score", 0.0)), c.get("ta_confidence", 0.0))
+
+    short_list = sorted(cands, key=_ta_key, reverse=True)[:top_k]
+
+    confirmed = []
+    evals = 0
+
+    for c in short_list:
+        tkr = c.get("ticker")
+        if not tkr:
+            continue
+
+        # AI cooldown per ticker
+        ts_last = _last_ai_eval.get(tkr)
+        if ts_last and (now_central() - ts_last).total_seconds() / 60.0 < AI_COOLDOWN_MIN:
+            continue
+
+        try:
+            df = fetch_5m_df(tkr)
+            if df is None or df.empty or len(df) < 30:
+                continue
+
+            df_ta = compute_indicators(df)
+            ta = evaluate_signal_ta(df_ta)
+
+            ai = ask_gpt_for_hybrid_score(tkr, df_ta)
+            if not ai or ai.get("ai_confidence", 0.0) < float(min_ai_conf):
+                continue
+
+            _last_ai_eval[tkr] = now_central()
+            evals += 1
+
+            blended = blend_scores(
+                ta_dir=ta["ta_direction"],
+                ta_score=ta["ta_score"],
+                ta_conf=ta["ta_confidence"],
+                ai=ai
+            )
+
+            last = df_ta.iloc[-1]
+            entry_price = float(last["Close"])
+
+            # ATR-based underlying TP/SL for context
+            try:
+                atr_val = float(last.get("ATR"))
+            except Exception:
+                atr_val = float("nan")
+            if not (np.isfinite(atr_val) and atr_val > 0):
+                atr_val = max(0.005 * entry_price, 0.25)
+
+            rr_mult = 2.5
+            if blended["direction"] == "CALL":
+                tp_under = round(entry_price + rr_mult * atr_val, 2)
+                sl_under = round(entry_price - 1.0 * atr_val, 2)
+            else:
+                tp_under = round(entry_price - rr_mult * atr_val, 2)
+                sl_under = round(entry_price + 1.0 * atr_val, 2)
+
+            # Minimal indicators payload for downstream logging/opening
+            indicators = {
+                "ATR": float(last.get("ATR")),
+                "ADX": float(last.get("ADX")),
+                "RSI14": float(last.get("RSI14")),
+                "EMA9": float(last.get("EMA9")),
+                "EMA21": float(last.get("EMA21")),
+                "VWAP": float(last.get("VWAP")),
+            }
+
+            confirmed.append({
+                "ticker": tkr,
+                "timestamp": df_ta.index[-1].isoformat(),
+                "direction": blended["direction"],
+                "score": blended["score"],
+                "confidence": blended["confidence"],
+                "entry_price": entry_price,
+                "tp_underlying": tp_under,
+                "sl_underlying": sl_under,
+                "blend_notes": blended["blend_notes"],
+                "indicators": indicators,
+                "ta": ta,
+                "ai": ai,
+            })
+
+            if evals >= MAX_AI_EVALS:
+                break
+
+        except Exception:
+            continue
+
+    return sorted(
+        confirmed,
+        key=lambda x: (x["confidence"], abs(x["score"])),
+        reverse=True
     )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) ROBINHOOD PAPER QUOTE HELPERS (OPTIONS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rh_login():
     try:
-        r.logout()
-        print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔓 Logged out.\n")
+        r.authentication.logout()
     except Exception:
         pass
-    
-    sys.exit(0)
+    return r.authentication.login(username=RH_USERNAME, password=RH_PASSWORD, expiresIn=86400, by_sms=True)
 
-def main():
-    global capital
-    # 1) Log in once at startup
-    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ⚙️  Current Version: 1.0.6\n")
-    print(f"\n{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} 🔐 Logging into Robinhood…")
-    r.authentication.login(RH_USERNAME, RH_PASSWORD)
-    print(f"{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S')} ✅ Logged in.")
 
-    load_state()
+def get_option_delta(opt_id: str) -> float | None:
+    """Try to read option delta from Robinhood; return absolute delta in [0,1] or None."""
+    try:
+        with suppress_robinhood_noise():
+            md = r.options.get_option_market_data_by_id(opt_id)
+        if isinstance(md, list):
+            md = md[0] if md else {}
+        raw = md.get("delta")
+        if raw in (None, "", "None"):
+            return None
+        d = abs(float(raw))
+        if 0.01 <= d <= 1.0:
+            return d
+        return None
+    except Exception:
+        return None
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
 
-    # Schedule entry at 09:00 ET (08:00 CST)
-    schedule.every().day.at("14:00").do(run_daily_entry) # 10am EST
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-    # Schedule exit checks every 15 minutes
-    schedule.every(5).minutes.do(run_exit_checks)
 
-    print(f"\n🚀 GPT Directional Bot Running — Capital: ${capital:.2f}\n")
+def choose_weekly_expiration(symbol: str, max_to_try: int = 4) -> list[str]:
+    """Prefer future Fridays, then others. Cached for ~30 minutes."""
+    try:
+        now_ts = time.time()
+        cache_ok = symbol in _EXP_CACHE["data"] and (now_ts - _EXP_CACHE["ts"].get(symbol, 0)) < _EXP_CACHE_TTL_SEC
+        if cache_ok:
+            return _EXP_CACHE["data"][symbol][:max_to_try]
+
+        with suppress_robinhood_noise():
+            all_opts = r.options.find_tradable_options(symbol) or []
+        if not all_opts:
+            return []
+        today = date.today()
+        exps = set()
+        for o in all_opts:
+            e = o.get("expiration_date")
+            if not e:
+                continue
+            try:
+                dt = dateparser.parse(e).date()
+                if dt >= today:
+                    exps.add(e)
+            except Exception:
+                continue
+        if not exps:
+            return []
+        exps_sorted = sorted(exps, key=lambda s: dateparser.parse(s).date())
+        fridays = [e for e in exps_sorted if dateparser.parse(e).date().weekday() == 4]
+        others  = [e for e in exps_sorted if e not in fridays]
+        ordered = fridays + others
+
+        _EXP_CACHE["data"][symbol] = ordered
+        _EXP_CACHE["ts"][symbol] = now_ts
+        return ordered[:max_to_try]
+    except Exception:
+        return []
+
+def get_option_md(opt_id: str) -> dict:
+    """Single-call MD: returns {'mark','bid','ask','delta'} (floats or None)."""
+    try:
+        with suppress_robinhood_noise():
+            md = r.options.get_option_market_data_by_id(opt_id)
+        if isinstance(md, list):
+            md = md[0] if md else {}
+        if not md:
+            return {"mark": None, "bid": None, "ask": None, "delta": None}
+        def fnum(k):
+            v = md.get(k)
+            try:
+                x = float(v)
+                return x if math.isfinite(x) else None
+            except Exception:
+                return None
+        out = {
+            "mark": fnum("mark_price") or (lambda b,a: (b+a)/2 if (b is not None and a is not None) else None)(fnum("bid_price"), fnum("ask_price")) or fnum("last_trade_price") or fnum("adjusted_mark_price"),
+            "bid":  fnum("bid_price"),
+            "ask":  fnum("ask_price"),
+            "delta": (lambda d: abs(d) if d is not None and 0.01 <= abs(d) <= 1.0 else None)(fnum("delta")),
+        }
+        return out
+    except Exception:
+        return {"mark": None, "bid": None, "ask": None, "delta": None}
+
+def _option_chain_for(symbol: str, expiration: str, opt_type: str):
+    """Return list of option instrument dicts for a symbol/expiry/type."""
+    try:
+        with suppress_robinhood_noise():
+            all_opts = r.options.find_tradable_options(symbol) or []
+        return [o for o in all_opts if o.get("expiration_date") == expiration and o.get("type") == opt_type]
+    except Exception:
+        return []
+
+
+def pick_option_contract(symbol: str, direction: str, underlying_price: float, expirations: list[str], atr: float | None = None) -> tuple[dict, str | None]:
+    """
+    Priority:
+      1) If ATR provided: pick contracts where expected return (delta * k*ATR / price) ∈ [15%,25%] for some k in ATR_K_LIST,
+         nearest to 20% and with smaller spread%.
+      2) Else: pick ~0.35–0.45 delta nearest to 0.40 (then smaller spread%).
+      3) Fallback: ATM (old method).
+    Returns ({option_symbol, option_id, strike, expiration, type, initial_mark}, reason|None)
+    """
+    opt_type = "call" if direction == "CALL" else "put"
+    best = None
+    best_key = None
+    reason = None
+
+    def _spread_pct(bid, ask, mark):
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            return float("inf")
+        spr = max(0.0, ask - bid)
+        base = mark if (mark and mark > 0) else (0.5*(bid+ask))
+        return spr / base if base and base > 0 else float("inf")
+
+    # Scan expirations
+    for exp in expirations:
+        chain = _option_chain_for(symbol, exp, opt_type)
+        if not chain:
+            continue
+
+        # Take ~ATM ± N strikes
+        def _strike(o):
+            try: return float(o.get("strike_price"))
+            except: return float("inf")
+        near_atm = sorted(chain, key=lambda o: abs(_strike(o) - underlying_price))[:MAX_STRIKE_CANDIDATES]
+
+        # Pass 1: ATR targeting if ATR given
+        if atr and atr > 0:
+            for inst in near_atm:
+                opt_id = inst.get("id")
+                strike_val = _strike(inst)
+                if not opt_id or not math.isfinite(strike_val):
+                    continue
+                md = get_option_md(opt_id)
+                mark, bid, ask, delta = md["mark"], md["bid"], md["ask"], md["delta"]
+                if mark is None or mark <= 0 or delta is None:
+                    continue
+                # expected return for k×ATR move
+                exp_rets = [delta * (k * atr) / mark for k in ATR_K_LIST]
+                # choose closest in-range; else skip to next pass
+                in_range = [er for er in exp_rets if TARGET_EXPECTED_RETURN_LO <= er <= TARGET_EXPECTED_RETURN_HI]
+                if not in_range:
+                    continue
+                # select by distance to midpoint + spread
+                dist = min(abs(er - 0.5*(TARGET_EXPECTED_RETURN_LO + TARGET_EXPECTED_RETURN_HI)) for er in in_range)
+                spct = _spread_pct(bid, ask, mark)
+                key = (dist, spct, abs(delta - 0.40))
+                pick = {
+                    "option_symbol": inst.get("symbol") or inst.get("id"),
+                    "option_id": opt_id,
+                    "strike": float(strike_val),
+                    "expiration": exp,
+                    "type": opt_type,
+                    "initial_mark": float(mark)
+                }
+                if best is None or key < best_key:
+                    best, best_key, reason = pick, key, f"ATR-targeted (k∈{ATR_K_LIST})"
+            if best:
+                return best, reason  # stop after first expiry with a good ATR-targeted hit
+
+        # Pass 2: Delta window 0.35–0.45
+        delta_candidates = []
+        for inst in near_atm:
+            opt_id = inst.get("id")
+            strike_val = _strike(inst)
+            if not opt_id or not math.isfinite(strike_val):
+                continue
+            md = get_option_md(opt_id)
+            mark, bid, ask, delta = md["mark"], md["bid"], md["ask"], md["delta"]
+            if mark is None or mark <= 0 or delta is None:
+                continue
+            if DELTA_TARGET_LO <= delta <= DELTA_TARGET_HI:
+                delta_candidates.append((abs(delta - 0.40), _spread_pct(bid, ask, mark), {
+                    "option_symbol": inst.get("symbol") or inst.get("id"),
+                    "option_id": opt_id,
+                    "strike": float(strike_val),
+                    "expiration": exp,
+                    "type": opt_type,
+                    "initial_mark": float(mark)
+                }))
+        if delta_candidates:
+            delta_candidates.sort(key=lambda t: (t[0], t[1]))
+            pick = delta_candidates[0][2]
+            return pick, "Delta-targeted 0.35–0.45"
+
+    # Pass 3: Fallback to ATM
+    fallback, err = pick_atm_option_symbol(symbol, direction, underlying_price, expirations)
+    return (fallback or {}), (err or "Fallback ATM")
+
+def pick_atm_option_symbol(symbol: str, direction: str, underlying_price: float, expirations: list[str]) -> tuple[dict, str | None]:
+    """Choose nearest-to-ATM contract with usable market data."""
+    opt_type = "call" if direction == "CALL" else "put"
+    last_err = "No expirations provided."
+    try:
+        with suppress_robinhood_noise():
+            all_opts = r.options.find_tradable_options(symbol) or []
+        if not all_opts:
+            return {}, f"No tradable options for {symbol}."
+        for exp in expirations or []:
+            chain = [o for o in all_opts if o.get("expiration_date") == exp and o.get("type") == opt_type]
+            if not chain:
+                last_err = f"No {opt_type} chain for {symbol} {exp}"
+                continue
+            def _strike(o):
+                try: return float(o.get("strike_price"))
+                except Exception: return float("inf")
+            candidates = sorted(chain, key=lambda o: abs(_strike(o) - underlying_price))
+            for inst in candidates[:10]:
+                opt_id = inst.get("id")
+                strike_val = _strike(inst)
+                if not opt_id or not math.isfinite(strike_val):
+                    continue
+                mark = get_option_mark_by_id(opt_id)
+                if mark is None:
+                    continue
+                return {
+                    "option_symbol": inst.get("symbol") or inst.get("id"),
+                    "option_id": opt_id,
+                    "strike": float(strike_val),
+                    "expiration": exp,
+                    "type": opt_type,
+                    "initial_mark": float(mark)
+                }, None
+            last_err = f"No usable quotes near ATM for {symbol} {opt_type} {exp}"
+        return {}, last_err
+    except Exception as e:
+        return {}, f"Chain selection error for {symbol} {opt_type}: {e}"
+
+
+def get_option_mark_by_id(opt_id: str) -> float | None:
+    """Fetch market data by instrument ID and compute a usable mark."""
+    try:
+        with suppress_robinhood_noise():
+            md = r.options.get_option_market_data_by_id(opt_id)
+        if isinstance(md, list):
+            md = md[0] if md else {}
+        if not isinstance(md, dict) or not md:
+            return None
+        def f(k):
+            v = md.get(k)
+            try:
+                return float(v) if v not in (None, "", "None") else None
+            except Exception:
+                return None
+        mark = f("mark_price")
+        if mark is not None:
+            return mark
+        bid, ask = f("bid_price"), f("ask_price")
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2.0
+        last = f("last_trade_price")
+        if last is not None:
+            return last
+        adj = f("adjusted_mark_price")
+        return adj
+    except Exception:
+        return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) TRADE STATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def open_new_trade_from_reco(reco):
+    """Open 1 long option based on reco; TP/SL in option-price terms via ATR/delta conversion."""
+    ticker = reco["ticker"]
+    direction = reco["direction"]
+    underlying_entry = reco["entry_underlying"]
+
+    ind = (reco.get("setup", {}) or {}).get("indicators", {}) if reco.get("setup") else {}
+    atr = ind.get("ATR", reco.get("atr"))
+    try:
+        atr = float(atr) if atr is not None else float("nan")
+    except Exception:
+        atr = float("nan")
+    if not (np.isfinite(atr) and atr > 0):
+        atr = None
+
+    expiries = choose_sensible_expirations(ticker, max_to_try=6)
+    if not expiries:
+        return None, f"No expirations available for {ticker}."
+
+    # Pick contract (ATR-targeted → delta-targeted → ATM fallback)
+    opt, err = pick_option_contract(ticker, direction, underlying_entry, expiries, atr=atr)
+    if not opt:
+        return None, err or "Could not resolve option contract."
+
+    selection_reason = err or "ATM"
+
+    option_symbol = opt.get("option_symbol")
+    option_id     = opt.get("option_id")
+    entry_mark    = opt.get("initial_mark")
+
+    if entry_mark is None:
+        entry_mark = get_option_mark_by_id(option_id)
+    if entry_mark is None:
+        return None, (f"Could not fetch mark for {ticker} {direction} {opt.get('expiration')} {opt.get('strike')} "
+                      f"(id={option_id}, sym={option_symbol})")
+
+    entry_fill = float(entry_mark) * (1.0 + SLIPPAGE_BUY)
+    est_cost   = entry_fill * 100.0
+    if est_cost > MAX_BUDGET_PER_TRADE:
+        return None, f"Estimated cost ${est_cost:.2f} exceeds budget ${MAX_BUDGET_PER_TRADE:.2f}"
+
+    # Convert underlying ATR targets → option TP/SL via delta (fallback 0.50)
+    und_entry = float(reco.get("entry_underlying", underlying_entry))
+    und_tp    = float(reco.get("tp_underlying", und_entry))
+    und_sl    = float(reco.get("sl_underlying", und_entry))
+
+    if direction == "CALL":
+        favorable_move = max(0.0, und_tp - und_entry)
+        adverse_move   = max(0.0, und_entry - und_sl)
+    else:
+        favorable_move = max(0.0, und_entry - und_tp)
+        adverse_move   = max(0.0, und_sl - und_entry)
+
+    delta_est = get_option_delta(option_id)
+    if delta_est is None:
+        logger.info(f"[open] {ticker} missing delta, fallback to 0.50")
+        delta_est = 0.50
+    delta_est = _clamp(delta_est, 0.10, 0.85)
+
+    opt_fav_change = delta_est * favorable_move
+    opt_adv_change = delta_est * adverse_move
+
+    # floors to avoid tiny targets on quiet days
+    min_tp_fallback = entry_fill * TP_PCT
+    min_sl_fallback = entry_fill * SL_PCT
+    if opt_fav_change < min_tp_fallback: opt_fav_change = min_tp_fallback
+    if opt_adv_change < min_sl_fallback: opt_adv_change = min_sl_fallback
+
+    tp_mark = entry_fill + opt_fav_change
+    sl_mark = entry_fill - opt_adv_change
+
+    tp_mark = _clamp(tp_mark, 0.01, entry_fill * 10.0)
+    sl_mark = _clamp(sl_mark, 0.01, entry_fill * 1.0)  # never above entry
+
+    trade = {
+        "id": f"{ticker}-{int(time.time())}",
+        "opened_at": now_central().isoformat(),
+        "ticker": ticker,
+        "direction": direction,
+        "option_symbol": option_symbol,
+        "option_id": option_id,
+        "expiration": opt.get("expiration"),
+        "strike": opt.get("strike"),
+        "side": "LONG",
+        "entry_mark": round(float(entry_mark), 4),
+        "entry_fill": round(float(entry_fill), 4),
+        "tp_mark": round(float(tp_mark), 4),
+        "sl_mark": round(float(sl_mark), 4),
+        "atr": atr,
+        "rr_tp_mult": 2.5,
+        "rr_sl_mult": 1.0,
+        "status": "OPEN",
+        "notes": (
+            f"{selection_reason}; paper via quotes only; "
+            f"blend={TA_WEIGHT}/{AI_WEIGHT if USE_AI else 0}; "
+            f"slippage buy/sell={SLIPPAGE_BUY:.2%}/{SLIPPAGE_SELL:.2%}"
+        ),
+        "last_check": now_central().isoformat(),
+        "delta_est": round(delta_est, 3),
+        "und_entry": und_entry,
+        "und_tp": und_tp,
+        "und_sl": und_sl,
+    }
+    return trade, None
+
+
+def monitor_open_trades():
+    trades = read_open_trades()
+    changed = False
+    keep = []
+    for t in trades:
+        if t.get("status") != "OPEN":
+            continue
+
+        mark = get_option_mark_by_id(t.get("option_id"))
+        t["last_check"] = now_central().isoformat()
+        if mark is None:
+            keep.append(t)
+            continue
+
+        mark = float(mark)
+        t["last_mark"] = round(mark, 4)
+
+        entry_basis = float(t.get("entry_fill") or t["entry_mark"])
+        sim_exit = mark * (1.0 - SLIPPAGE_SELL)
+
+        pnl_per = (sim_exit - entry_basis) * 100.0
+        roi_pct = (pnl_per / (entry_basis * 100.0)) * 100.0 if entry_basis > 0 else 0.0
+
+        logger.info(
+            f"[monitor] {t['ticker']} {t['direction']} "
+            f"entry={entry_basis:.3f} mark={mark:.3f} "
+            f"sim_exit={sim_exit:.3f} PnL=${pnl_per:.2f} ROI={roi_pct:.2f}% "
+            f"TP={t.get('tp_mark')} SL={t.get('sl_mark')}"
+        )
+
+        # 1R in option-price terms is distance from entry to SL
+        sl_price = float(t.get("sl_mark"))
+        risk_price = max(0.0, entry_basis - sl_price)
+        risk_1R_opt = risk_price * 100.0
+
+        # Trail to breakeven after +1R
+        if pnl_per >= risk_1R_opt and risk_1R_opt > 0:
+            be_stop = entry_basis
+            old_sl = float(t["sl_mark"])
+            new_sl = max(old_sl, be_stop)
+            if new_sl > old_sl + 1e-6:
+                t["sl_mark"] = round(new_sl, 4)
+                t["trail_armed"] = True
+                logger.info(f"[trail] {t['ticker']} +1R reached. Move SL → breakeven (old={old_sl:.3f}, new={t['sl_mark']:.3f})")
+                changed = True
+
+            peak = float(t.get("peak_mark") or entry_basis)
+            if mark > peak:
+                t["peak_mark"] = round(mark, 4)
+
+        # TP/SL execution (option price)
+        if mark >= float(t["tp_mark"]):
+            t["status"] = "CLOSED_TP"
+            t["closed_at"] = now_central().isoformat()
+            t["exit_mark"] = round(mark * (1.0 - SLIPPAGE_SELL), 4)
+            append_closed_trade({
+                "id": t["id"], "ticker": t["ticker"], "direction": t["direction"],
+                "option_symbol": t.get("option_symbol"), "opened_at": t["opened_at"],
+                "closed_at": t["closed_at"], "entry_mark": t["entry_mark"],
+                "exit_mark": t["exit_mark"],
+                "pnl_pct": round((t["exit_mark"] - entry_basis) / entry_basis, 4),
+                "reason": "TP"
+            })
+            changed = True
+        elif mark <= float(t["sl_mark"]):
+            t["status"] = "CLOSED_SL"
+            t["closed_at"] = now_central().isoformat()
+            t["exit_mark"] = round(mark * (1.0 - SLIPPAGE_SELL), 4)
+            append_closed_trade({
+                "id": t["id"], "ticker": t["ticker"], "direction": t["direction"],
+                "option_symbol": t.get("option_symbol"), "opened_at": t["opened_at"],
+                "closed_at": t["closed_at"], "entry_mark": t["entry_mark"],
+                "exit_mark": t["exit_mark"],
+                "pnl_pct": round((t["exit_mark"] - entry_basis) / entry_basis, 4),
+                "reason": "SL"
+            })
+            changed = True
+        else:
+            keep.append(t)
+
+    if changed:
+        write_open_trades(keep)
+
+
+def maybe_open_top_trade(recs_json):
+    trades = read_open_trades()
+    if any(t.get("status") == "OPEN" for t in trades):
+        logger.info("[open] A trade is already OPEN; skipping new entry.")
+        return
+
+    existing = {(t["ticker"], t["direction"]) for t in trades if t.get("status") == "OPEN"}
+    candidates = (recs_json.get("top_trades", []) or [])[:TOP_N]
+    if not candidates:
+        logger.info("[open] No candidates.")
+        return
+
+    for cand in candidates:
+        key = (cand["ticker"], cand["direction"])
+        if key in existing:
+            logger.info(f"[open] Skipping {cand['ticker']} {cand['direction']}: already open.")
+            continue
+        trade, err = open_new_trade_from_reco(cand)
+        if err or not trade:
+            logger.info(f"[open] {cand['ticker']} {cand['direction']} not taken: {err}")
+            continue
+        trades.append(trade)
+        write_open_trades(trades)
+        logger.info(
+            f"[open] NEW {trade['ticker']} {trade['direction']} "
+            f"fill={trade['entry_fill']} (mark={trade['entry_mark']}) → "
+            f"TP {trade['tp_mark']} / SL {trade['sl_mark']} "
+            f"(budget ≤ ${MAX_BUDGET_PER_TRADE:.2f})"
+        )
+        return  # take only one
+    logger.info("[open] No affordable candidates in the top list.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) LOGGING HELPERS (TA candidates & AI Top 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log_ta_candidates(ta_diag, top_preview: int = 10):
+    """Append all TA-passed candidates to CSV and print a concise preview."""
+    as_of = now_central().isoformat()
+    passed = [d for d in ta_diag if d.get("pass")]
+    if not passed:
+        logger.info("[TA] No candidates passed thresholds.")
+        return
+
+    # CSV append
+    fields = ["as_of","ticker","ta_score","ta_confidence","ta_direction","close","atr","atr_pct","adx","bars"]
+    for d in passed:
+        last = d.get("last", {})
+        row = {
+            "as_of": as_of,
+            "ticker": d.get("ticker"),
+            "ta_score": d.get("ta_score"),
+            "ta_confidence": d.get("ta_confidence"),
+            "ta_direction": d.get("ta_direction"),
+            "close": last.get("close"),
+            "atr": last.get("atr"),
+            "atr_pct": last.get("atr_pct"),
+            "adx": last.get("adx"),
+            "bars": d.get("bars"),
+        }
+        append_csv_row(TA_LOG_CSV, fields, row)
+
+    # Console preview
+    ordered = sorted(
+    passed,
+    key=lambda x: (abs(x.get("ta_score") or 0.0), x.get("ta_confidence") or 0.0),
+    reverse=True,
+    )
+    lines = []
+    for i, d in enumerate(ordered[:top_preview], start=1):
+        last = d.get("last", {})
+        lines.append(
+            f"#{i:>2} {d['ticker']:>5} | sc={d.get('ta_score'):>4} "
+            f"cf={d.get('ta_confidence'):>4} dir={d.get('ta_direction','?'):>4} "
+            f"ATR%={last.get('atr_pct')} ADX={last.get('adx')}"
+        )
+    logger.info("[TA] Passed candidates (top preview):\n" + "\n".join("  - " + s for s in lines))
+
+
+def log_ai_top3(confirmed):
+    """Append Top 3 AI-confirmed to CSV and print to console."""
+    if not confirmed:
+        logger.info("[AI] No AI-confirmed candidates.")
+        return
+    as_of = now_central().isoformat()
+    top3 = confirmed[:3]
+    fields = ["as_of","rank","ticker","direction","confidence","score","entry_price","tp_underlying","sl_underlying","ai_confidence","ai_direction"]
+    for i, rj in enumerate(top3, start=1):
+        ai = rj.get("ai", {})
+        row = {
+            "as_of": as_of,
+            "rank": i,
+            "ticker": rj.get("ticker"),
+            "direction": rj.get("direction"),
+            "confidence": rj.get("confidence"),
+            "score": rj.get("score"),
+            "entry_price": rj.get("entry_price"),
+            "tp_underlying": rj.get("tp_underlying"),
+            "sl_underlying": rj.get("sl_underlying"),
+            "ai_confidence": ai.get("ai_confidence"),
+            "ai_direction": ai.get("ai_direction"),
+        }
+        append_csv_row(AI_LOG_CSV, fields, row)
+
+    # Console preview
+    lines = [
+        f"#{i} {rj['ticker']} {rj['direction']} conf={rj['confidence']:.2f} "
+        f"score={rj['score']:.2f} entry={rj['entry_price']:.2f}"
+        for i, rj in enumerate(top3, start=1)
+    ]
+    indented = ["  - " + s for s in lines]
+    logger.info("[AI] Top 3 confirmed:\n" + "\n".join(indented))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8) SELECTIVE CYCLE & MAIN LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def trading_window_open() -> bool:
+    now = now_central()
+    if not is_market_day(now):
+        return False
+    # US equities RTH in CT: 08:30–15:00
+    start = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    end   = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    return start <= now <= end
+
+
+def near_close_buffer() -> bool:
+    now = now_central()
+    close = now.replace(hour=15, minute=0, second=0, microsecond=0)  # 3:00 PM CT
+    return (close - now).total_seconds() / 60.0 <= MARKET_CLOSE_BUFFER_MIN
+
+
+def has_open_trade() -> bool:
+    return any(t.get("status") == "OPEN" for t in read_open_trades())
+
+
+def ensure_rh():
+    if not DO_RH_LOGIN:
+        return
+    try:
+        r.profiles.load_account_profile()
+    except Exception:
+        logger.info("[rh] Logging in…")
+        rh_login()
+
+
+def run_cycle_selective():
+    ensure_rh()
+    # 1) Manage exits first
+    monitor_open_trades()
+
+    # 2) If any open position, do NOT scan
+    if has_open_trade():
+        # logger.info("[cycle] Position OPEN → monitoring only; no scanning.")
+        return
+
+    # 3) Scan only during RTH unless explicitly allowed
+    if ENFORCE_RTH and (not trading_window_open() or near_close_buffer()):
+        logger.info("[cycle] Outside trading window or near close → skipping scan.")
+        return
+
+    # 4) Cheap TA prefilter on 1m (with full diagnostics)
+    ta_cands, ta_diag = ta_prefilter(
+        TICKERS,
+        min_conf=TA_CONF_MIN,
+        min_abs_score=TA_SCORE_MIN,
+        return_all=True,
+    )
+
+    # Log TA potential trades
+    log_ta_candidates(ta_diag)
+
+    if not ta_cands:
+        logger.info("[cycle] No TA candidates passed thresholds → flat.")
+        return
+
+    # 5) AI-confirm only the best few
+    confirmed = ai_confirm_candidates(
+        ta_cands,
+        top_k=min(len(ta_cands), MAX_AI_EVALS),
+        min_ai_conf=AI_CONF_MIN,   # ← add this
+    )
+
+    # Log AI Top 3
+    log_ai_top3(confirmed)
+
+    if not confirmed:
+        logger.info("[cycle] No AI-confirmed candidates (cooldown/thresholds) → flat.")
+        return
+
+    # 6) Keep only strong AI ideas
+    strong = [rj for rj in confirmed if rj["confidence"] >= AI_CONF_MIN and rj["score"] >= AI_SCORE_MIN]
+    if not strong:
+        logger.info("[cycle] AI ideas below confidence/score gates → flat.")
+        return
+
+    # 7) Form JSON compatible with maybe_open_top_trade
+    out_json = {
+        "as_of": now_central().isoformat(),
+        "universe": TICKERS,
+        "strategy": {
+            "type": "hybrid_ta_ai" if USE_AI else "ta_only",
+            "ta_weight": TA_WEIGHT,
+            "ai_weight": AI_WEIGHT if USE_AI else 0.0,
+            "model": OPENAI_MODEL if USE_AI else None
+        },
+        "top_trades": [
+            {
+                "rank": i + 1,
+                "ticker": rj["ticker"],
+                "direction": rj["direction"],
+                "confidence": rj["confidence"],
+                "score": rj["score"],
+                "timestamp": rj["timestamp"],
+                "entry_underlying": rj["entry_price"],
+                "tp_underlying": rj["tp_underlying"],
+                "sl_underlying": rj["sl_underlying"],
+                "blend_notes": rj["blend_notes"],
+                "setup": {
+                    "indicators": rj["indicators"],
+                    "ta": rj["ta"],
+                    "ai": rj["ai"]
+                }
+            } for i, rj in enumerate(strong[:TOP_N])
+        ]
+    }
+    write_recommendations_json(out_json)
+
+    # 8) Attempt single open (affordability checked inside)
+    maybe_open_top_trade(out_json)
+
+
+def main_loop():
+    logger.info("Options Bot starting (V1.0.0)…")
+    ensure_rh()
+
+    # Ensure state files exist
+    if not os.path.exists(OPEN_TRADES_JSON):
+        write_open_trades([])
+
+    schedule.every(2).minutes.do(run_cycle_selective)
+    logger.info("Scheduler started: selective cycle every 2 minutes.")
+
+    # Kick off immediately once
+    run_cycle_selective()
 
     while True:
-        schedule.run_pending()
-        time.sleep(5)
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Stopping.")
+            break
+        except Exception as e:
+            logger.error(f"[loop] Error: {e}", exc_info=True)
+            time.sleep(5)
+
 
 if __name__ == "__main__":
-    main()
+    main_loop()
