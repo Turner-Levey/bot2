@@ -114,6 +114,7 @@ MON_FRI_ONLY = True       # weekend guard
 USE_US_HOLIDAYS = True   # requires `pip install holidays`; safe if left False
 MARKET_CLOSE_BUFFER_MIN = 20  # don’t open new trades within this many minutes of close
 _GATE_BLOCKED_REASON = None  # None | "not_market_day" | "after_hours" | "near_close"
+EOD_FLATTEN_MIN = 8  # force-close open positions this many minutes before 3:00 PM CT
 
 # Prefilter debug knobs
 PREFILTER_DEBUG = False
@@ -851,7 +852,7 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
             except Exception:
                 atr_val = float("nan")
             if not (np.isfinite(atr_val) and atr_val > 0):
-                atr_val = max(0.005 * entry_price, 0.25)
+                atr_val = max(0.003 * entry_price, 0.10)
 
             # --- NEW: ADX-based TP multiplier ---
             try:
@@ -902,6 +903,7 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
                 "indicators": indicators,
                 "ta": ta,
                 "ai": ai,
+                "rr_tp_mult": rr_mult,
             })
 
             if evals >= MAX_AI_EVALS:
@@ -1248,7 +1250,7 @@ def open_new_trade_from_reco(reco):
     delta_est = get_option_delta(option_id)
     if delta_est is None:
         logger.info(f"[open] {ticker} missing delta, fallback to 0.50")
-        delta_est = 0.50
+        delta_est = 0.40 
     delta_est = _clamp(delta_est, 0.10, 0.85)
 
     opt_fav_change = delta_est * favorable_move
@@ -1281,7 +1283,7 @@ def open_new_trade_from_reco(reco):
         "tp_mark": round(float(tp_mark), 4),
         "sl_mark": round(float(sl_mark), 4),
         "atr": atr,
-        "rr_tp_mult": 2.5,
+        "rr_tp_mult": float(reco.get("rr_tp_mult", 1.5)),
         "rr_sl_mult": 1.0,
         "status": "OPEN",
         "notes": (
@@ -1304,22 +1306,86 @@ def open_new_trade_from_reco(reco):
 
 
 def monitor_open_trades():
+    """
+    Monitor all OPEN trades:
+      - Force-close within EOD_FLATTEN_MIN of 3:00 PM CT (bid preferred, mark fallback).
+      - 1R trail to breakeven using INITIAL risk.
+      - Stepped trailing: 1.5R => SL = entry + 0.5R, 2R => SL = entry + 1.0R (capped below TP).
+      - Normal TP/SL checks.
+      - Persist cash snapshots and closures to CSV/JSON.
+    """
     trades = read_open_trades()
     keep = []
-    closed_rows = []   # batch write after loop
+    closed_rows = []
     any_change = False
 
-    # Keep a rolling cash snapshot for anything still open while we loop
+    # Current free cash snapshot (used for UI while monitoring)
     current_cash = compute_capital(trades)
+
+    # Are we inside the EOD flatten window?
+    try:
+        eod_force = eod_flatten_window()
+    except NameError:
+        eod_force = False
+
     for t in trades:
         if t.get("status") != "OPEN":
             continue
 
-        # always carry a live cash snapshot in file
+        # Always carry a live cash snapshot in file
         t["capital_available"] = round(current_cash, 2)
-
-        mark = get_option_mark_by_id(t.get("option_id"))
         t["last_check"] = now_central().isoformat()
+
+        # Ensure we remember the INITIAL SL for R calculations
+        try:
+            entry_basis = float(t.get("entry_fill") or t.get("entry_mark"))
+        except Exception:
+            entry_basis = 0.0
+        if "init_sl_mark" not in t or t.get("init_sl_mark") is None:
+            try:
+                t["init_sl_mark"] = float(t.get("sl_mark", 0.0))
+            except Exception:
+                t["init_sl_mark"] = 0.0
+
+        # ---------- EOD FORCE FLATTEN (before normal logic) ----------
+        if eod_force:
+            md_full = get_option_md(t.get("option_id"))
+            bid = md_full.get("bid") if isinstance(md_full, dict) else None
+            basis = bid if (bid is not None and bid > 0) else None
+            if basis is None:
+                # fallback to mark if bid is not available
+                m = get_option_mark_by_id(t.get("option_id"))
+                basis = m if (m is not None and m > 0) else None
+
+            if basis is not None and entry_basis > 0:
+                exit_fill = round(float(basis) * (1.0 - SLIPPAGE_SELL), 4)
+                t["status"] = "CLOSED_EOD"
+                t["closed_at"] = now_central().isoformat()
+                t["exit_mark"] = exit_fill
+                pnl_pct = round((exit_fill - entry_basis) / entry_basis, 4)
+                closed_rows.append({
+                    "id": t["id"],
+                    "ticker": t["ticker"],
+                    "direction": t["direction"],
+                    "option_symbol": t.get("option_symbol"),
+                    "opened_at": t["opened_at"],
+                    "closed_at": t["closed_at"],
+                    "entry_mark": t.get("entry_mark"),
+                    "entry_fill": t.get("entry_fill"),
+                    "exit_mark": exit_fill,
+                    "exit_fill": exit_fill,
+                    "pnl_pct": pnl_pct,
+                    "reason": "EOD",
+                })
+                any_change = True
+                continue
+            else:
+                # no quote => keep and try next loop
+                keep.append(t)
+                continue
+
+        # ---------- NORMAL QUOTE PATH ----------
+        mark = get_option_mark_by_id(t.get("option_id"))
         if mark is None:
             keep.append(t)
             continue
@@ -1327,9 +1393,7 @@ def monitor_open_trades():
         mark = float(mark)
         t["last_mark"] = round(mark, 4)
 
-        entry_basis = float(t.get("entry_fill") or t["entry_mark"])
         sim_exit = mark * (1.0 - SLIPPAGE_SELL)
-
         pnl_dollars = (sim_exit - entry_basis) * 100.0
         roi_pct = ((pnl_dollars / (entry_basis * 100.0)) * 100.0) if entry_basis > 0 else 0.0
 
@@ -1340,11 +1404,18 @@ def monitor_open_trades():
             f"TP={t.get('tp_mark')} SL={t.get('sl_mark')}"
         )
 
-        # 1R trail to breakeven
-        sl_price = float(t.get("sl_mark"))
-        risk_price = max(0.0, entry_basis - sl_price)
-        risk_1R_opt = risk_price * 100.0
-        if pnl_dollars >= risk_1R_opt and risk_1R_opt > 0:
+        # --- R math based on INITIAL risk ---
+        try:
+            init_sl = float(t.get("init_sl_mark", t.get("sl_mark")))
+        except Exception:
+            init_sl = float(t.get("sl_mark") or 0.0)
+
+        sl_price_cur = float(t.get("sl_mark"))
+        risk_init = max(0.0, entry_basis - init_sl)         # in option-price terms
+        R_dollars = risk_init * 100.0                       # options are x100
+
+        # 1R trail to breakeven (use initial risk)
+        if R_dollars > 0 and pnl_dollars >= R_dollars:
             old_sl = float(t["sl_mark"])
             be_stop = entry_basis
             if be_stop > old_sl + 1e-6:
@@ -1353,11 +1424,33 @@ def monitor_open_trades():
                 logger.info(f"[trail] {t['ticker']} +1R reached. Move SL → breakeven (old={old_sl:.3f}, new={t['sl_mark']:.3f})")
                 any_change = True
 
-            peak = float(t.get("peak_mark") or entry_basis)
-            if mark > peak:
-                t["peak_mark"] = round(mark, 4)
+        # Track peak mark
+        peak = float(t.get("peak_mark") or entry_basis)
+        if mark > peak:
+            t["peak_mark"] = round(mark, 4)
 
-        # TP / SL checks
+        # Stepped trailing: 1.5R => SL = entry + 0.5R; 2R => SL = entry + 1.0R
+        if R_dollars > 0:
+            new_sl = None
+            # 1.5R step
+            if pnl_dollars >= 1.5 * R_dollars:
+                target_05R = entry_basis + 0.5 * risk_init
+                new_sl = max(float(t.get("sl_mark", sl_price_cur)), target_05R)
+            # 2R step
+            if pnl_dollars >= 2.0 * R_dollars:
+                target_10R = entry_basis + 1.0 * risk_init
+                new_sl = target_10R if new_sl is None else max(new_sl, target_10R)
+
+            if new_sl is not None and new_sl > float(t.get("sl_mark", sl_price_cur)) + 1e-6:
+                # keep SL below TP by a hair to avoid instant closes on tiny spreads
+                cap_sl = min(new_sl, float(t["tp_mark"]) - 1e-4)
+                if cap_sl > float(t["sl_mark"]) + 1e-6:
+                    old_sl2 = float(t["sl_mark"])
+                    t["sl_mark"] = round(cap_sl, 4)
+                    logger.info(f"[trail] {t['ticker']} stepped trail → SL {old_sl2:.3f} → {t['sl_mark']:.3f}")
+                    any_change = True
+
+        # TP / SL checks (using current mark path)
         hit_tp = mark >= float(t["tp_mark"])
         hit_sl = mark <= float(t["sl_mark"])
 
@@ -1365,10 +1458,9 @@ def monitor_open_trades():
             t["status"] = "CLOSED_TP" if hit_tp else "CLOSED_SL"
             t["closed_at"] = now_central().isoformat()
             exit_fill = round(mark * (1.0 - SLIPPAGE_SELL), 4)
-            t["exit_mark"] = exit_fill  # kept original field name
+            t["exit_mark"] = exit_fill
             pnl_pct = round((exit_fill - entry_basis) / entry_basis, 4)
 
-            # collect closed row; we'll add capital_after later in one shot
             closed_rows.append({
                 "id": t["id"],
                 "ticker": t["ticker"],
@@ -1377,31 +1469,29 @@ def monitor_open_trades():
                 "opened_at": t["opened_at"],
                 "closed_at": t["closed_at"],
                 "entry_mark": t["entry_mark"],
-                "entry_fill": t["entry_fill"],   # new: actual cost basis
+                "entry_fill": t["entry_fill"],
                 "exit_mark": exit_fill,
-                "exit_fill": exit_fill,          # new: actual proceeds
+                "exit_fill": exit_fill,
                 "pnl_pct": pnl_pct,
-                "reason": "TP" if hit_tp else "SL"
+                "reason": "TP" if hit_tp else "SL",
             })
             any_change = True
-            # do NOT append to keep (it’s closed)
         else:
             keep.append(t)
 
-    # After loop: compute capital AFTER applying all these closures
+    # ---------- Persist state & cash after any closures ----------
     if any_change:
-        # realized PnL so far in CSV + new closures from this pass
         realized_so_far = compute_realized_pnl_from_csv()
         new_realized = 0.0
         for row in closed_rows:
-            entry_fill = _as_float(row["entry_fill"] or row["entry_mark"])
-            exit_fill  = _as_float(row["exit_fill"]  or row["exit_mark"])
+            entry_fill = _as_float(row.get("entry_fill") or row.get("entry_mark"))
+            exit_fill  = _as_float(row.get("exit_fill")  or row.get("exit_mark"))
             new_realized += (exit_fill - entry_fill) * 100.0
 
         capital_after = STARTING_CAPITAL + realized_so_far + new_realized - sum_open_cost(keep)
-
-        # stamp capital snapshot on all remaining opens
         cap_rounded = round(capital_after, 2)
+
+        # stamp capital snapshot on remaining OPENs
         for ot in keep:
             if ot.get("status") == "OPEN":
                 ot["capital_available"] = cap_rounded
@@ -1409,16 +1499,15 @@ def monitor_open_trades():
         # write open file first (closed positions removed)
         write_open_trades(keep)
 
-        # append closed rows with a cash snapshot and emit one-line close logs
+        # append closed rows with cash snapshot + pretty log
         for row in closed_rows:
-            row["capital_after"] = cap_rounded  # new column in CSV
+            row["capital_after"] = cap_rounded
             append_closed_trade(row)
 
-            # pretty one-liner in console
             sym = row["ticker"]
             side = row["direction"]
-            efill = _as_float(row["entry_fill"] or row["entry_mark"])
-            xfill = _as_float(row["exit_fill"]  or row["exit_mark"])
+            efill = _as_float(row.get("entry_fill") or row.get("entry_mark"))
+            xfill = _as_float(row.get("exit_fill")  or row.get("exit_mark"))
             pnl_usd = (xfill - efill) * 100.0
             pnl_pc = ((xfill - efill) / efill * 100.0) if efill > 0 else 0.0
             logger.info(
@@ -1572,6 +1661,13 @@ def near_close_buffer() -> bool:
     return (close - now).total_seconds() / 60.0 <= MARKET_CLOSE_BUFFER_MIN
 
 
+def eod_flatten_window() -> bool:
+    now = now_central()
+    close = now.replace(hour=15, minute=0, second=0, microsecond=0)  # 3:00 PM CT
+    mins = (close - now).total_seconds() / 60.0
+    return 0 < mins <= EOD_FLATTEN_MIN
+
+
 def has_open_trade() -> bool:
     return any(t.get("status") == "OPEN" for t in read_open_trades())
 
@@ -1673,6 +1769,7 @@ def run_cycle_selective():
                 "tp_underlying": rj["tp_underlying"],
                 "sl_underlying": rj["sl_underlying"],
                 "blend_notes": rj["blend_notes"],
+                "rr_tp_mult": rj.get("rr_tp_mult"),
                 "setup": {
                     "indicators": rj["indicators"],
                     "ta": rj["ta"],
@@ -1688,7 +1785,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.3)…")
+    logger.info("Options Bot starting (V1.0.4)…")
     ensure_rh()
 
     # Ensure state files exist
