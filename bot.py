@@ -119,6 +119,8 @@ _GATE_BLOCKED_REASON = None  # None | "not_market_day" | "after_hours" | "near_c
 PREFILTER_DEBUG = False
 PREFILTER_DEBUG_PATH = "last_prefilter_debug.json"
 
+STARTING_CAPITAL = 1000
+
 # --- legacy % TP/SL (used as floors if ATR/delta conversion yields too small targets) ---
 TP_PCT = 0.08     # 8% floor for TP (option mark)
 SL_PCT = 0.05     # 5% floor for SL (option mark)
@@ -145,9 +147,9 @@ VOL_SURGE_MULT   = 1.5    # volume confirmation multiplier vs 20-bar avg
 TA_SCORE_MIN    = 1.6
 TA_CONF_MIN     = 0.55
 MAX_AI_EVALS    = 5
-AI_CONF_MIN     = 0.55
+AI_CONF_MIN     = 0.45
 AI_SCORE_MIN    = 1.5
-AI_COOLDOWN_MIN = 30  # don’t re-AI-score same ticker within X minutes
+AI_COOLDOWN_MIN = 1  # don’t re-AI-score same ticker within X minutes
 
 # Contract selection rules ─────────────────────────────────────────────────
 PREFER_3TO5_DTE_THU_FRI = True        # prefer 3–5 DTE when it's Thu/Fri
@@ -240,6 +242,42 @@ def read_open_trades():
             return json.load(f)
         except Exception:
             return []
+
+def _as_float(x, default=0.0):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+def sum_open_cost(trades) -> float:
+    """Cash tied up in currently open option(s), in dollars."""
+    total = 0.0
+    for t in trades:
+        if t.get("status") == "OPEN":
+            entry_basis = _as_float(t.get("entry_fill") or t.get("entry_mark"))
+            total += entry_basis * 100.0
+    return total
+
+def compute_realized_pnl_from_csv() -> float:
+    """Realized PnL from closed trades CSV, in dollars."""
+    if not os.path.exists(CLOSED_TRADES_CSV):
+        return 0.0
+    total = 0.0
+    with open(CLOSED_TRADES_CSV, "r", newline="") as f:
+        rdr = csv.DictReader(f)
+        for row in rdr:
+            entry_fill = _as_float(row.get("entry_fill") or row.get("entry_mark"))
+            exit_fill  = _as_float(row.get("exit_fill")  or row.get("exit_mark"))
+            total += (exit_fill - entry_fill) * 100.0
+    return total
+
+def compute_capital(open_trades_override=None) -> float:
+    """Free cash = starting + realized PnL − cost of currently open positions."""
+    current_opens = open_trades_override if open_trades_override is not None else read_open_trades()
+    realized = compute_realized_pnl_from_csv()
+    reserved = sum_open_cost(current_opens)
+    return STARTING_CAPITAL + realized - reserved
 
 def write_open_trades(trades):
     safe_mkdir(OPEN_TRADES_JSON)
@@ -784,7 +822,7 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
 
         try:
             df = fetch_5m_df(tkr)
-            if df is None or df.empty or len(df) < 30:
+            if df is None or df.empty or len(df) < 26:
                 continue
 
             df_ta = compute_indicators(df)
@@ -815,7 +853,25 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
             if not (np.isfinite(atr_val) and atr_val > 0):
                 atr_val = max(0.005 * entry_price, 0.25)
 
-            rr_mult = 2.5
+            # --- NEW: ADX-based TP multiplier ---
+            try:
+                adx_val = float(last.get("ADX"))
+            except Exception:
+                adx_val = float("nan")
+
+            # Fallback rr if ADX is missing/invalid
+            default_rr = 1.5
+
+            if not (np.isfinite(adx_val) and adx_val > 0):
+                rr_mult = default_rr
+            elif adx_val < 25:
+                rr_mult = 1.2       # weak/sideways → tighter TP
+            elif adx_val < 35:
+                rr_mult = 1.5       # moderate trend
+            else:
+                rr_mult = 2.0       # strong trend → stretch TP a bit
+
+            # Compute TP/SL on the underlying
             if blended["direction"] == "CALL":
                 tp_under = round(entry_price + rr_mult * atr_val, 2)
                 sl_under = round(entry_price - 1.0 * atr_val, 2)
@@ -851,7 +907,7 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
             if evals >= MAX_AI_EVALS:
                 break
 
-        except Exception:
+        except Exception as e:
             continue
 
     return sorted(
@@ -1239,16 +1295,28 @@ def open_new_trade_from_reco(reco):
         "und_tp": und_tp,
         "und_sl": und_sl,
     }
+
+    existing = read_open_trades()
+    capital_after_open = STARTING_CAPITAL + compute_realized_pnl_from_csv() - (sum_open_cost(existing) + (entry_fill * 100.0))
+    trade["capital_available"] = round(capital_after_open, 2)
+
     return trade, None
 
 
 def monitor_open_trades():
     trades = read_open_trades()
-    changed = False
     keep = []
+    closed_rows = []   # batch write after loop
+    any_change = False
+
+    # Keep a rolling cash snapshot for anything still open while we loop
+    current_cash = compute_capital(trades)
     for t in trades:
         if t.get("status") != "OPEN":
             continue
+
+        # always carry a live cash snapshot in file
+        t["capital_available"] = round(current_cash, 2)
 
         mark = get_option_mark_by_id(t.get("option_id"))
         t["last_check"] = now_central().isoformat()
@@ -1262,68 +1330,113 @@ def monitor_open_trades():
         entry_basis = float(t.get("entry_fill") or t["entry_mark"])
         sim_exit = mark * (1.0 - SLIPPAGE_SELL)
 
-        pnl_per = (sim_exit - entry_basis) * 100.0
-        roi_pct = (pnl_per / (entry_basis * 100.0)) * 100.0 if entry_basis > 0 else 0.0
+        pnl_dollars = (sim_exit - entry_basis) * 100.0
+        roi_pct = ((pnl_dollars / (entry_basis * 100.0)) * 100.0) if entry_basis > 0 else 0.0
 
         logger.info(
             f"[monitor] {t['ticker']} {t['direction']} "
             f"entry={entry_basis:.3f} mark={mark:.3f} "
-            f"sim_exit={sim_exit:.3f} PnL=${pnl_per:.2f} ROI={roi_pct:.2f}% "
+            f"sim_exit={sim_exit:.3f} PnL=${pnl_dollars:.2f} ROI={roi_pct:.2f}% "
             f"TP={t.get('tp_mark')} SL={t.get('sl_mark')}"
         )
 
-        # 1R in option-price terms is distance from entry to SL
+        # 1R trail to breakeven
         sl_price = float(t.get("sl_mark"))
         risk_price = max(0.0, entry_basis - sl_price)
         risk_1R_opt = risk_price * 100.0
-
-        # Trail to breakeven after +1R
-        if pnl_per >= risk_1R_opt and risk_1R_opt > 0:
-            be_stop = entry_basis
+        if pnl_dollars >= risk_1R_opt and risk_1R_opt > 0:
             old_sl = float(t["sl_mark"])
-            new_sl = max(old_sl, be_stop)
-            if new_sl > old_sl + 1e-6:
-                t["sl_mark"] = round(new_sl, 4)
+            be_stop = entry_basis
+            if be_stop > old_sl + 1e-6:
+                t["sl_mark"] = round(be_stop, 4)
                 t["trail_armed"] = True
                 logger.info(f"[trail] {t['ticker']} +1R reached. Move SL → breakeven (old={old_sl:.3f}, new={t['sl_mark']:.3f})")
-                changed = True
+                any_change = True
 
             peak = float(t.get("peak_mark") or entry_basis)
             if mark > peak:
                 t["peak_mark"] = round(mark, 4)
 
-        # TP/SL execution (option price)
-        if mark >= float(t["tp_mark"]):
-            t["status"] = "CLOSED_TP"
+        # TP / SL checks
+        hit_tp = mark >= float(t["tp_mark"])
+        hit_sl = mark <= float(t["sl_mark"])
+
+        if hit_tp or hit_sl:
+            t["status"] = "CLOSED_TP" if hit_tp else "CLOSED_SL"
             t["closed_at"] = now_central().isoformat()
-            t["exit_mark"] = round(mark * (1.0 - SLIPPAGE_SELL), 4)
-            append_closed_trade({
-                "id": t["id"], "ticker": t["ticker"], "direction": t["direction"],
-                "option_symbol": t.get("option_symbol"), "opened_at": t["opened_at"],
-                "closed_at": t["closed_at"], "entry_mark": t["entry_mark"],
-                "exit_mark": t["exit_mark"],
-                "pnl_pct": round((t["exit_mark"] - entry_basis) / entry_basis, 4),
-                "reason": "TP"
+            exit_fill = round(mark * (1.0 - SLIPPAGE_SELL), 4)
+            t["exit_mark"] = exit_fill  # kept original field name
+            pnl_pct = round((exit_fill - entry_basis) / entry_basis, 4)
+
+            # collect closed row; we'll add capital_after later in one shot
+            closed_rows.append({
+                "id": t["id"],
+                "ticker": t["ticker"],
+                "direction": t["direction"],
+                "option_symbol": t.get("option_symbol"),
+                "opened_at": t["opened_at"],
+                "closed_at": t["closed_at"],
+                "entry_mark": t["entry_mark"],
+                "entry_fill": t["entry_fill"],   # new: actual cost basis
+                "exit_mark": exit_fill,
+                "exit_fill": exit_fill,          # new: actual proceeds
+                "pnl_pct": pnl_pct,
+                "reason": "TP" if hit_tp else "SL"
             })
-            changed = True
-        elif mark <= float(t["sl_mark"]):
-            t["status"] = "CLOSED_SL"
-            t["closed_at"] = now_central().isoformat()
-            t["exit_mark"] = round(mark * (1.0 - SLIPPAGE_SELL), 4)
-            append_closed_trade({
-                "id": t["id"], "ticker": t["ticker"], "direction": t["direction"],
-                "option_symbol": t.get("option_symbol"), "opened_at": t["opened_at"],
-                "closed_at": t["closed_at"], "entry_mark": t["entry_mark"],
-                "exit_mark": t["exit_mark"],
-                "pnl_pct": round((t["exit_mark"] - entry_basis) / entry_basis, 4),
-                "reason": "SL"
-            })
-            changed = True
+            any_change = True
+            # do NOT append to keep (it’s closed)
         else:
             keep.append(t)
 
-    if changed:
+    # After loop: compute capital AFTER applying all these closures
+    if any_change:
+        # realized PnL so far in CSV + new closures from this pass
+        realized_so_far = compute_realized_pnl_from_csv()
+        new_realized = 0.0
+        for row in closed_rows:
+            entry_fill = _as_float(row["entry_fill"] or row["entry_mark"])
+            exit_fill  = _as_float(row["exit_fill"]  or row["exit_mark"])
+            new_realized += (exit_fill - entry_fill) * 100.0
+
+        capital_after = STARTING_CAPITAL + realized_so_far + new_realized - sum_open_cost(keep)
+
+        # stamp capital snapshot on all remaining opens
+        cap_rounded = round(capital_after, 2)
+        for ot in keep:
+            if ot.get("status") == "OPEN":
+                ot["capital_available"] = cap_rounded
+
+        # write open file first (closed positions removed)
         write_open_trades(keep)
+
+        # append closed rows with a cash snapshot and emit one-line close logs
+        for row in closed_rows:
+            row["capital_after"] = cap_rounded  # new column in CSV
+            append_closed_trade(row)
+
+            # pretty one-liner in console
+            sym = row["ticker"]
+            side = row["direction"]
+            efill = _as_float(row["entry_fill"] or row["entry_mark"])
+            xfill = _as_float(row["exit_fill"]  or row["exit_mark"])
+            pnl_usd = (xfill - efill) * 100.0
+            pnl_pc = ((xfill - efill) / efill * 100.0) if efill > 0 else 0.0
+            logger.info(
+                f"[close] {sym} {side} {row['reason']} "
+                f"entry={efill:.3f} exit={xfill:.3f} "
+                f"PnL=${pnl_usd:.2f} ({pnl_pc:.2f}%) cash=${cap_rounded:.2f}"
+            )
+    else:
+        # even if nothing closed, keep a fresh cash snapshot on opens
+        cap_rounded = round(compute_capital(keep or trades), 2)
+        touched = False
+        for ot in keep or trades:
+            if ot.get("status") == "OPEN":
+                if ot.get("capital_available") != cap_rounded:
+                    ot["capital_available"] = cap_rounded
+                    touched = True
+        if touched:
+            write_open_trades(keep or trades)
 
 
 def maybe_open_top_trade(recs_json):
@@ -1353,7 +1466,7 @@ def maybe_open_top_trade(recs_json):
             f"[open] NEW {trade['ticker']} {trade['direction']} "
             f"fill={trade['entry_fill']} (mark={trade['entry_mark']}) → "
             f"TP {trade['tp_mark']} / SL {trade['sl_mark']} "
-            f"(budget ≤ ${MAX_BUDGET_PER_TRADE:.2f})"
+            f"(budget ≤ ${MAX_BUDGET_PER_TRADE:.2f}) cash=${trade.get('capital_available', 0):.2f}"
         )
         return  # take only one
     logger.info("[open] No affordable candidates in the top list.")
@@ -1367,7 +1480,7 @@ def log_ta_candidates(ta_diag, top_preview: int = 10):
     as_of = now_central().isoformat()
     passed = [d for d in ta_diag if d.get("pass")]
     if not passed:
-        logger.info("[TA] No candidates passed thresholds.")
+        # logger.info("[TA] No candidates passed thresholds.")
         return
 
     # CSV append
@@ -1408,7 +1521,7 @@ def log_ta_candidates(ta_diag, top_preview: int = 10):
 def log_ai_top3(confirmed):
     """Append Top 3 AI-confirmed to CSV and print to console."""
     if not confirmed:
-        logger.info("[AI] No AI-confirmed candidates.")
+        # logger.info("[AI] No AI-confirmed candidates.")
         return
     as_of = now_central().isoformat()
     top3 = confirmed[:3]
@@ -1575,7 +1688,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.2)…")
+    logger.info("Options Bot starting (V1.0.3)…")
     ensure_rh()
 
     # Ensure state files exist
