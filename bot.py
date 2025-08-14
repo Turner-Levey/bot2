@@ -1650,7 +1650,7 @@ def trading_window_open() -> bool:
     if not is_market_day(now):
         return False
     # US equities RTH in CT: 08:30–15:00
-    start = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    start = now.replace(hour=10, minute=30, second=0, microsecond=0)
     end   = now.replace(hour=15, minute=0, second=0, microsecond=0)
     return start <= now <= end
 
@@ -1785,7 +1785,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.4)…")
+    logger.info("Options Bot starting (V1.0.5)…")
     ensure_rh()
 
     # Ensure state files exist
