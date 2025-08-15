@@ -764,31 +764,43 @@ def _all_future_expirations(symbol: str) -> list[str]:
 
 def choose_sensible_expirations(symbol: str, max_to_try: int = 6) -> list[str]:
     """
-    Prefer 3–5 DTE when it's Thu/Fri; else Friday-first ordering.
-    Fallback to earliest future expiries.
+    Thu/Fri rule:
+      - Use 3–5 DTE when available.
+      - If none, go to the first expirations with DTE > 5 (skip 0–2 DTE entirely).
+    Other days:
+      - Friday-first ordering (original behavior).
     """
     exps = _all_future_expirations(symbol)
     if not exps:
         return []
 
     today = now_central().date()
-    wkday = today.weekday()  # Mon=0 ... Sun=6
-    if PREFER_3TO5_DTE_THU_FRI and wkday in (3, 4):  # Thu or Fri
-        # Filter expiries with DTE in [3..5]
-        dte_3to5 = []
-        others = []
-        for e in exps:
-            dte = (dateparser.parse(e).date() - today).days
-            (dte_3to5 if 3 <= dte <= 5 else others).append(e)
-        if dte_3to5:
-            return dte_3to5[:max_to_try]
-        # else fall through to normal ordering below
 
-    # Friday-first default
-    fridays = [e for e in exps if dateparser.parse(e).date().weekday() == 4]
-    others  = [e for e in exps if e not in fridays]
-    ordered = fridays + others
-    return ordered[:max_to_try]
+    def _dte(e: str) -> int:
+        return (dateparser.parse(e).date() - today).days
+
+    # Only keep expirations >= today (defensive)
+    dtes = [(e, _dte(e)) for e in exps if _dte(e) >= 0]
+
+    if not dtes:
+        return []
+
+    wkday = today.weekday()  # Mon=0 … Fri=4
+
+    if PREFER_3TO5_DTE_THU_FRI and wkday in (3, 4):
+        in_3to5 = [e for e, d in dtes if 3 <= d <= 5]
+        if in_3to5:
+            return in_3to5[:max_to_try]
+
+        beyond_5 = [e for e, d in dtes if d > 5]
+        # IMPORTANT: if none >5, we return [] to skip ultra-short DTEs instead of taking same-day/1–2 DTE
+        return beyond_5[:max_to_try]
+
+    # Non-Thu/Fri: Friday-first ordering (same as before)
+    fridays = [e for e, _ in dtes if dateparser.parse(e).date().weekday() == 4]
+    others  = [e for e, _ in dtes if e not in fridays]
+    return (fridays + others)[:max_to_try]
+
 
 def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
     """
@@ -1650,7 +1662,7 @@ def trading_window_open() -> bool:
     if not is_market_day(now):
         return False
     # US equities RTH in CT: 08:30–15:00
-    start = now.replace(hour=10, minute=30, second=0, microsecond=0)
+    start = now.replace(hour=10, minute=35, second=0, microsecond=0)
     end   = now.replace(hour=15, minute=0, second=0, microsecond=0)
     return start <= now <= end
 
@@ -1785,7 +1797,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.7)…")
+    logger.info("Options Bot starting (V1.0.8)…")
     ensure_rh()
 
     # Ensure state files exist
