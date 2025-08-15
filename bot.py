@@ -1614,7 +1614,6 @@ def log_ai_top3(confirmed):
         return
     as_of = now_central().isoformat()
     top3 = confirmed[:3]
-    print(top3)
     fields = ["as_of","rank","ticker","direction","confidence","score","entry_price","tp_underlying","sl_underlying","ai_confidence","ai_direction"]
     for i, rj in enumerate(top3, start=1):
         ai = rj.get("ai", {})
@@ -1636,7 +1635,7 @@ def log_ai_top3(confirmed):
     # Console preview
     lines = [
         f"#{i} {rj['ticker']} {rj['direction']} conf={rj['confidence']:.2f} "
-        f"score={rj['score']:.2f} entry={rj['entry_price']:.2f} rationale={rj['entry_price']:.2f}"
+        f"score={rj['score']:.2f} entry={rj['entry_price']:.2f} rationale={rj['rationale']}"
         for i, rj in enumerate(top3, start=1)
     ]
     indented = ["  - " + s for s in lines]
@@ -1786,7 +1785,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.5)…")
+    logger.info("Options Bot starting (V1.0.6)…")
     ensure_rh()
 
     # Ensure state files exist
