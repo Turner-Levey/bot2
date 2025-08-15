@@ -796,6 +796,7 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
     recompute TA here on 5m, run AI on the top_k by TA strength, and return the
     confirmed list sorted by blended confidence then abs(score).
     """
+    print("_client")
     if not USE_AI or _client is None:
         return []  # AI disabled → no confirmations
     
@@ -1735,6 +1736,8 @@ def run_cycle_selective():
         top_k=min(len(ta_cands), MAX_AI_EVALS),
         min_ai_conf=AI_CONF_MIN,   # ← add this
     )
+
+    print(confirmed)
 
     # Log AI Top 3
     log_ai_top3(confirmed)
