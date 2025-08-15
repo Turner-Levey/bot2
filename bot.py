@@ -159,7 +159,7 @@ DELTA_TARGET_HI = 0.45
 TARGET_EXPECTED_RETURN_LO = 0.15      # aim 15–25% return for k×ATR favorable move
 TARGET_EXPECTED_RETURN_HI = 0.25
 ATR_K_LIST = [1.0, 1.5, 2.0]          # test 1×, 1.5×, 2× ATR moves
-MAX_STRIKE_CANDIDATES = 20            # strikes to scan around ATM per expiry
+MAX_STRIKE_CANDIDATES = 12            # strikes to scan around ATM per expiry
 
 OPEN_TRADES_JSON = "open_trades.json"
 CLOSED_TRADES_CSV = "closed_trades.csv"
@@ -1797,7 +1797,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.8)…")
+    logger.info("Options Bot starting (V1.0.9)…")
     ensure_rh()
 
     # Ensure state files exist
