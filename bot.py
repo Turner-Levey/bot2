@@ -109,7 +109,7 @@ PREFILTER_INTERVAL = "1m"
 PREFILTER_PERIOD   = "1d"
 
 # RTH gating / market days
-ENFORCE_RTH = True        # ← set False to allow scans anytime
+ENFORCE_RTH = False        # ← set False to allow scans anytime
 MON_FRI_ONLY = True       # weekend guard
 USE_US_HOLIDAYS = True   # requires `pip install holidays`; safe if left False
 MARKET_CLOSE_BUFFER_MIN = 20  # don’t open new trades within this many minutes of close
@@ -798,6 +798,8 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
     """
     if not USE_AI or _client is None:
         return []  # AI disabled → no confirmations
+    
+    print(_client)
 
     if not cands:
         return []
@@ -1742,10 +1744,10 @@ def run_cycle_selective():
         return
 
     # 6) Keep only strong AI ideas
-    strong = [rj for rj in confirmed if rj["confidence"] >= AI_CONF_MIN and rj["score"] >= AI_SCORE_MIN]
-    if not strong:
-        logger.info("[cycle] AI ideas below confidence/score gates → flat.")
-        return
+    def _is_strong(idea):
+        return (idea["confidence"] >= AI_CONF_MIN) and (abs(idea["score"]) >= AI_SCORE_MIN)
+
+    strong = [rj for rj in confirmed if _is_strong(rj)]
 
     # 7) Form JSON compatible with maybe_open_top_trade
     out_json = {
