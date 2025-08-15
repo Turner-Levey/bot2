@@ -58,7 +58,8 @@ try:
         _client = OpenAI(api_key=OPENAI_API_KEY)
     else:
         _client = None
-except Exception:
+except Exception as e:
+    print(e)
     _client = None
     USE_AI = False
 
