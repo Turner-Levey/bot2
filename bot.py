@@ -109,7 +109,7 @@ PREFILTER_INTERVAL = "1m"
 PREFILTER_PERIOD   = "1d"
 
 # RTH gating / market days
-ENFORCE_RTH = False        # ← set False to allow scans anytime
+ENFORCE_RTH = True        # ← set False to allow scans anytime
 MON_FRI_ONLY = True       # weekend guard
 USE_US_HOLIDAYS = True   # requires `pip install holidays`; safe if left False
 MARKET_CLOSE_BUFFER_MIN = 20  # don’t open new trades within this many minutes of close
@@ -1785,7 +1785,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.6)…")
+    logger.info("Options Bot starting (V1.0.7)…")
     ensure_rh()
 
     # Ensure state files exist
