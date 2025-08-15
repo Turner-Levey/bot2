@@ -1635,7 +1635,7 @@ def log_ai_top3(confirmed):
     # Console preview
     lines = [
         f"#{i} {rj['ticker']} {rj['direction']} conf={rj['confidence']:.2f} "
-        f"score={rj['score']:.2f} entry={rj['entry_price']:.2f} rationale={rj['rationale']}"
+        f"score={rj['score']:.2f} entry={rj['entry_price']:.2f} rationale={rj['ai']['rationale']}"
         for i, rj in enumerate(top3, start=1)
     ]
     indented = ["  - " + s for s in lines]
