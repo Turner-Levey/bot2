@@ -59,13 +59,8 @@ try:
     else:
         _client = None
 except Exception as e:
-    print(e)
     _client = None
     USE_AI = False
-
-print(OPENAI_API_KEY)
-print(_client)
-print(USE_AI)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0) USER SETTINGS
@@ -1619,6 +1614,7 @@ def log_ai_top3(confirmed):
         return
     as_of = now_central().isoformat()
     top3 = confirmed[:3]
+    print(top3)
     fields = ["as_of","rank","ticker","direction","confidence","score","entry_price","tp_underlying","sl_underlying","ai_confidence","ai_direction"]
     for i, rj in enumerate(top3, start=1):
         ai = rj.get("ai", {})
@@ -1640,7 +1636,7 @@ def log_ai_top3(confirmed):
     # Console preview
     lines = [
         f"#{i} {rj['ticker']} {rj['direction']} conf={rj['confidence']:.2f} "
-        f"score={rj['score']:.2f} entry={rj['entry_price']:.2f}"
+        f"score={rj['score']:.2f} entry={rj['entry_price']:.2f} rationale={rj['entry_price']:.2f}"
         for i, rj in enumerate(top3, start=1)
     ]
     indented = ["  - " + s for s in lines]
