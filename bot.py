@@ -381,6 +381,49 @@ def is_market_day(dt):
             pass
     return True
 
+def _ensure_open_snapshots(t):
+    """If an OPEN trade is missing TA/indicator snapshots, compute them once."""
+    need = not t.get("indicators_at_open") or not t.get("ta_snapshot_open")
+    if not need:
+        return t
+    try:
+        df = fetch_5m_df(t["ticker"])
+        if df is None or df.empty or len(df) < 26:
+            return t
+        df_ta = compute_indicators(df)
+        ta = evaluate_signal_ta(df_ta)
+        last = df_ta.iloc[-1]
+
+        def f(x):
+            try:
+                v = float(x);  return v if math.isfinite(v) else None
+            except Exception:
+                return None
+
+        ind = {
+            "ATR": f(last.get("ATR")),
+            "ADX": f(last.get("ADX")),
+            "RSI14": f(last.get("RSI14")),
+            "EMA9": f(last.get("EMA9")),
+            "EMA21": f(last.get("EMA21")),
+            "VWAP": f(last.get("VWAP")),
+        }
+        ai = t.get("ai_snapshot_open") or {}
+        if USE_AI and (_client is not None) and not ai:
+            ai = ask_gpt_for_hybrid_score(t["ticker"], df_ta) or {}
+
+        t["indicators_at_open"] = t.get("indicators_at_open") or ind
+        t["ta_snapshot_open"]   = t.get("ta_snapshot_open")   or ta
+        t["ai_snapshot_open"]   = t.get("ai_snapshot_open")   or ai
+
+        t["ta_dir_open"]  = t.get("ta_dir_open") or ta.get("ta_direction")
+        t["ta_sc_open"]   = t.get("ta_sc_open")  or ta.get("ta_score")
+        t["ta_cf_open"]   = t.get("ta_cf_open")  or ta.get("ta_confidence")
+        t["ta_reasons_open"] = t.get("ta_reasons_open") or ta.get("ta_reasons", [])
+    except Exception:
+        pass
+    return t
+
 def get_underlying_price_now(ticker: str) -> float | None:
     try:
         with suppress_robinhood_noise():
@@ -1377,13 +1420,49 @@ def open_new_trade_from_reco(reco):
     }
 
     setup = (reco.get("setup") or {})
-    trade["indicators_at_open"] = (setup.get("indicators") or {})
-    trade["ta_snapshot_open"]   = (setup.get("ta") or {})
-    trade["ai_snapshot_open"]   = (setup.get("ai") or {})
-    # convenience scalars for CSV columns
+    ta_snap = (setup.get("ta") or {})
+    ind_snap = (setup.get("indicators") or {})
+    ai_snap = (setup.get("ai") or {})
+
+    # If anything is missing, recompute quickly on 5m now
+    if not ind_snap or not ta_snap:
+        try:
+            df_open = fetch_5m_df(ticker)
+            if df_open is not None and not df_open.empty and len(df_open) >= 26:
+                df_open_ta = compute_indicators(df_open)
+                ta_snap = ta_snap or evaluate_signal_ta(df_open_ta)
+                last = df_open_ta.iloc[-1]
+
+                def f(x):
+                    try:
+                        v = float(x)
+                        return v if math.isfinite(v) else None
+                    except Exception:
+                        return None
+
+                ind_snap = ind_snap or {
+                    "ATR": f(last.get("ATR")),
+                    "ADX": f(last.get("ADX")),
+                    "RSI14": f(last.get("RSI14")),
+                    "EMA9": f(last.get("EMA9")),
+                    "EMA21": f(last.get("EMA21")),
+                    "VWAP": f(last.get("VWAP")),
+                }
+
+                if (not ai_snap) and USE_AI and (_client is not None):
+                    ai_snap = ask_gpt_for_hybrid_score(ticker, df_open_ta) or {}
+        except Exception:
+            pass
+
+    # Flatten and attach (ensure JSON-serializable)
+    trade["indicators_at_open"] = ind_snap or {}
+    trade["ta_snapshot_open"]   = ta_snap or {}
+    trade["ai_snapshot_open"]   = ai_snap or {}
+
     trade["ta_dir_open"]  = trade["ta_snapshot_open"].get("ta_direction")
     trade["ta_sc_open"]   = trade["ta_snapshot_open"].get("ta_score")
     trade["ta_cf_open"]   = trade["ta_snapshot_open"].get("ta_confidence")
+    trade["ta_reasons_open"] = trade["ta_snapshot_open"].get("ta_reasons", [])  
 
     existing = read_open_trades()
     capital_after_open = STARTING_CAPITAL + compute_realized_pnl_from_csv() - (sum_open_cost(existing) + (entry_fill * 100.0))
@@ -1423,6 +1502,8 @@ def monitor_open_trades():
         t["capital_available"] = round(current_cash, 2)
         t["last_check"] = now_central().isoformat()
 
+        t = _ensure_open_snapshots(t)
+
         # Ensure we remember the INITIAL SL for R calculations
         try:
             entry_basis = float(t.get("entry_fill") or t.get("entry_mark"))
@@ -1449,7 +1530,6 @@ def monitor_open_trades():
                 t["status"] = "CLOSED_EOD"
                 t["closed_at"] = now_central().isoformat()
                 t["exit_mark"] = exit_fill
-                pnl_pct = round((exit_fill - entry_basis) / entry_basis, 4)
 
                 underlying_close = get_underlying_price_now(t["ticker"])
 
@@ -1586,7 +1666,6 @@ def monitor_open_trades():
             t["closed_at"] = now_central().isoformat()
             exit_fill = round(mark * (1.0 - SLIPPAGE_SELL), 4)
             t["exit_mark"] = exit_fill
-            pnl_pct = round((exit_fill - entry_basis) / entry_basis, 4)
 
             underlying_close = get_underlying_price_now(t["ticker"])
 
@@ -1952,7 +2031,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.10)…")
+    logger.info("Options Bot starting (V1.0.11)…")
     ensure_rh()
 
     # Ensure state files exist
