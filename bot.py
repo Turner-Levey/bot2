@@ -159,7 +159,7 @@ DELTA_TARGET_HI = 0.45
 TARGET_EXPECTED_RETURN_LO = 0.15      # aim 15–25% return for k×ATR favorable move
 TARGET_EXPECTED_RETURN_HI = 0.25
 ATR_K_LIST = [1.0, 1.5, 2.0]          # test 1×, 1.5×, 2× ATR moves
-MAX_STRIKE_CANDIDATES = 12            # strikes to scan around ATM per expiry
+MAX_STRIKE_CANDIDATES = 8             # strikes to scan around ATM per expiry
 
 OPEN_TRADES_JSON = "open_trades.json"
 CLOSED_TRADES_CSV = "closed_trades.csv"
@@ -169,6 +169,27 @@ RECS_JSON = "last_recommendations.json"
 LOG_DIR = "logs"
 TA_LOG_CSV = os.path.join(LOG_DIR, "ta_candidates.csv")
 AI_LOG_CSV = os.path.join(LOG_DIR, "ai_top3.csv")
+
+CLOSED_FIELDS = [
+    # core
+    "id","ticker","direction","side",
+    "option_symbol","option_id","expiration","strike",
+    "opened_at","closed_at","reason",
+
+    # fills/prices
+    "entry_mark","entry_fill","exit_mark","exit_fill",
+    "pnl_pct","capital_after",
+
+    # underlying context (at open & at close)
+    "und_entry","und_tp","und_sl","underlying_close",  # underlying_close gathered at exit
+
+    # risk/targets on option
+    "tp_mark","sl_mark","delta_est","rr_tp_mult","rr_sl_mult",
+
+    # indicators at open (underlying)
+    "atr","ta_direction_open","ta_score_open","ta_conf_open",
+    "ta_reasons_open","indicators_at_open","ai_snapshot_open","notes"
+]
 
 # Robinhood (paper) – quotes only
 RH_USERNAME = os.getenv("RH_USERNAME", "your_email@example.com")
@@ -235,6 +256,16 @@ def safe_mkdir(path: str):
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
+def _cell(x):
+    if x is None:
+        return ""
+    if isinstance(x, (dict, list)):
+        try:
+            return json.dumps(x, separators=(",",":"), ensure_ascii=False)
+        except Exception:
+            return str(x)
+    return x
+
 def read_open_trades():
     if not os.path.exists(OPEN_TRADES_JSON):
         return []
@@ -288,11 +319,28 @@ def write_open_trades(trades):
 def append_closed_trade(row_dict):
     safe_mkdir(CLOSED_TRADES_CSV)
     exists = os.path.exists(CLOSED_TRADES_CSV)
-    with open(CLOSED_TRADES_CSV, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row_dict)
+
+    # Ensure we output exactly CLOSED_FIELDS, in order
+    row = {k: _cell(row_dict.get(k)) for k in CLOSED_FIELDS}
+
+    # If file exists but with a different header, you may want to rotate it.
+    # Simplest: if headers mismatch, start fresh.
+    need_header = True
+    if exists:
+        with open(CLOSED_TRADES_CSV, "r", newline="") as f:
+            try:
+                rdr = csv.reader(f)
+                header = next(rdr)
+                need_header = header != CLOSED_FIELDS
+            except Exception:
+                need_header = True
+
+    mode = "a" if exists and not need_header else "w"
+    with open(CLOSED_TRADES_CSV, mode, newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CLOSED_FIELDS)
+        if need_header:
+            w.writeheader()
+        w.writerow(row)
 
 def write_recommendations_json(recs):
     with open(RECS_JSON, "w") as f:
@@ -332,6 +380,24 @@ def is_market_day(dt):
         except Exception:
             pass
     return True
+
+def get_underlying_price_now(ticker: str) -> float | None:
+    try:
+        with suppress_robinhood_noise():
+            px = r.stocks.get_latest_price(ticker, includeExtendedHours=False)
+        if isinstance(px, list) and px:
+            val = float(px[0])
+            return val if math.isfinite(val) else None
+    except Exception:
+        pass
+    # yfinance fallback (slower)
+    try:
+        df = yf.download(ticker, period="1d", interval="1m", progress=False, auto_adjust=False, prepost=False)
+        if df is not None and not df.empty:
+            return float(df["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
 
 # Trading window & AI cooldown
 _last_ai_eval = {}  # {ticker: datetime}
@@ -1310,6 +1376,15 @@ def open_new_trade_from_reco(reco):
         "und_sl": und_sl,
     }
 
+    setup = (reco.get("setup") or {})
+    trade["indicators_at_open"] = (setup.get("indicators") or {})
+    trade["ta_snapshot_open"]   = (setup.get("ta") or {})
+    trade["ai_snapshot_open"]   = (setup.get("ai") or {})
+    # convenience scalars for CSV columns
+    trade["ta_dir_open"]  = trade["ta_snapshot_open"].get("ta_direction")
+    trade["ta_sc_open"]   = trade["ta_snapshot_open"].get("ta_score")
+    trade["ta_cf_open"]   = trade["ta_snapshot_open"].get("ta_confidence")
+
     existing = read_open_trades()
     capital_after_open = STARTING_CAPITAL + compute_realized_pnl_from_csv() - (sum_open_cost(existing) + (entry_fill * 100.0))
     trade["capital_available"] = round(capital_after_open, 2)
@@ -1375,20 +1450,60 @@ def monitor_open_trades():
                 t["closed_at"] = now_central().isoformat()
                 t["exit_mark"] = exit_fill
                 pnl_pct = round((exit_fill - entry_basis) / entry_basis, 4)
-                closed_rows.append({
+
+                underlying_close = get_underlying_price_now(t["ticker"])
+
+                closed_row = {
+                    # core identity
                     "id": t["id"],
                     "ticker": t["ticker"],
                     "direction": t["direction"],
+                    "side": t.get("side", "LONG"),
                     "option_symbol": t.get("option_symbol"),
+                    "option_id": t.get("option_id"),
+                    "expiration": t.get("expiration"),
+                    "strike": t.get("strike"),
+
+                    # times & reason
                     "opened_at": t["opened_at"],
                     "closed_at": t["closed_at"],
+                    "reason": "EOD" if eod_force else ("TP" if hit_tp else "SL"),
+
+                    # fills/prices
                     "entry_mark": t.get("entry_mark"),
                     "entry_fill": t.get("entry_fill"),
-                    "exit_mark": exit_fill,
+                    "exit_mark": exit_fill,      # we treat exit_mark as the realized basis after slippage
                     "exit_fill": exit_fill,
-                    "pnl_pct": pnl_pct,
-                    "reason": "EOD",
-                })
+                    "pnl_pct": round((exit_fill - _as_float(t.get("entry_fill") or t.get("entry_mark"))) /
+                                    max(_as_float(t.get("entry_fill") or t.get("entry_mark")), 1e-9), 4),
+
+                    # capital snapshot (set later in your existing code after totals calc)
+                    "capital_after": None,  # placeholder, updated below
+
+                    # underlying context
+                    "und_entry": t.get("und_entry"),
+                    "und_tp": t.get("und_tp"),
+                    "und_sl": t.get("und_sl"),
+                    "underlying_close": underlying_close,
+
+                    # option risk/targets
+                    "tp_mark": t.get("tp_mark"),
+                    "sl_mark": t.get("sl_mark"),
+                    "delta_est": t.get("delta_est"),
+                    "rr_tp_mult": t.get("rr_tp_mult"),
+                    "rr_sl_mult": t.get("rr_sl_mult", 1.0),
+
+                    # indicators at open / TA snapshot
+                    "atr": t.get("atr"),
+                    "ta_direction_open": t.get("ta_dir_open") or (t.get("ta_snapshot_open") or {}).get("ta_direction"),
+                    "ta_score_open": t.get("ta_sc_open") or (t.get("ta_snapshot_open") or {}).get("ta_score"),
+                    "ta_conf_open": t.get("ta_cf_open") or (t.get("ta_snapshot_open") or {}).get("ta_confidence"),
+                    "ta_reasons_open": (t.get("ta_snapshot_open") or {}).get("ta_reasons"),
+                    "indicators_at_open": t.get("indicators_at_open"),
+                    "ai_snapshot_open": t.get("ai_snapshot_open"),
+                    "notes": t.get("notes"),
+                }
+                closed_rows.append(closed_row)
                 any_change = True
                 continue
             else:
@@ -1473,20 +1588,60 @@ def monitor_open_trades():
             t["exit_mark"] = exit_fill
             pnl_pct = round((exit_fill - entry_basis) / entry_basis, 4)
 
-            closed_rows.append({
+            underlying_close = get_underlying_price_now(t["ticker"])
+
+            closed_row = {
+                # core identity
                 "id": t["id"],
                 "ticker": t["ticker"],
                 "direction": t["direction"],
+                "side": t.get("side", "LONG"),
                 "option_symbol": t.get("option_symbol"),
+                "option_id": t.get("option_id"),
+                "expiration": t.get("expiration"),
+                "strike": t.get("strike"),
+
+                # times & reason
                 "opened_at": t["opened_at"],
                 "closed_at": t["closed_at"],
-                "entry_mark": t["entry_mark"],
-                "entry_fill": t["entry_fill"],
-                "exit_mark": exit_fill,
+                "reason": "EOD" if eod_force else ("TP" if hit_tp else "SL"),
+
+                # fills/prices
+                "entry_mark": t.get("entry_mark"),
+                "entry_fill": t.get("entry_fill"),
+                "exit_mark": exit_fill,      # we treat exit_mark as the realized basis after slippage
                 "exit_fill": exit_fill,
-                "pnl_pct": pnl_pct,
-                "reason": "TP" if hit_tp else "SL",
-            })
+                "pnl_pct": round((exit_fill - _as_float(t.get("entry_fill") or t.get("entry_mark"))) /
+                                  max(_as_float(t.get("entry_fill") or t.get("entry_mark")), 1e-9), 4),
+
+                # capital snapshot (set later in your existing code after totals calc)
+                "capital_after": None,  # placeholder, updated below
+
+                # underlying context
+                "und_entry": t.get("und_entry"),
+                "und_tp": t.get("und_tp"),
+                "und_sl": t.get("und_sl"),
+                "underlying_close": underlying_close,
+
+                # option risk/targets
+                "tp_mark": t.get("tp_mark"),
+                "sl_mark": t.get("sl_mark"),
+                "delta_est": t.get("delta_est"),
+                "rr_tp_mult": t.get("rr_tp_mult"),
+                "rr_sl_mult": t.get("rr_sl_mult", 1.0),
+
+                # indicators at open / TA snapshot
+                "atr": t.get("atr"),
+                "ta_direction_open": t.get("ta_dir_open") or (t.get("ta_snapshot_open") or {}).get("ta_direction"),
+                "ta_score_open": t.get("ta_sc_open") or (t.get("ta_snapshot_open") or {}).get("ta_score"),
+                "ta_conf_open": t.get("ta_cf_open") or (t.get("ta_snapshot_open") or {}).get("ta_confidence"),
+                "ta_reasons_open": (t.get("ta_snapshot_open") or {}).get("ta_reasons"),
+                "indicators_at_open": t.get("indicators_at_open"),
+                "ai_snapshot_open": t.get("ai_snapshot_open"),
+                "notes": t.get("notes"),
+            }
+            closed_rows.append(closed_row)
+
             any_change = True
         else:
             keep.append(t)
@@ -1661,7 +1816,7 @@ def trading_window_open() -> bool:
     now = now_central()
     if not is_market_day(now):
         return False
-    # US equities RTH in CT: 08:30–15:00
+    # US equities RTH in CT: 10:35–15:00
     start = now.replace(hour=10, minute=35, second=0, microsecond=0)
     end   = now.replace(hour=15, minute=0, second=0, microsecond=0)
     return start <= now <= end
@@ -1797,7 +1952,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.9)…")
+    logger.info("Options Bot starting (V1.0.10)…")
     ensure_rh()
 
     # Ensure state files exist
