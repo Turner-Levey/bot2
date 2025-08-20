@@ -126,7 +126,7 @@ EOD_FLATTEN_MIN = 8  # force-close open positions this many minutes before 3:00 
 PREFILTER_DEBUG = False
 PREFILTER_DEBUG_PATH = "last_prefilter_debug.json"
 
-STARTING_CAPITAL = 1000
+STARTING_CAPITAL = 5000
 
 # --- legacy % TP/SL (used as floors if ATR/delta conversion yields too small targets) ---
 TP_PCT = 0.08     # 8% floor for TP (option mark)
@@ -2111,7 +2111,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.12)…")
+    logger.info("Options Bot starting (V1.0.13)…")
     ensure_rh()
 
     # Ensure state files exist
