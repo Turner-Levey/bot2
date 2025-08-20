@@ -108,6 +108,12 @@ TIMEZONE = "America/Chicago"
 PREFILTER_INTERVAL = "1m"
 PREFILTER_PERIOD   = "1d"
 
+# ── position sizing ──────────────────────────────────────────────────────────
+RISK_PCT_PER_TRADE = 0.06          # ≤ 6% of available capital
+MAX_CONTRACTS_PER_TRADE = 10       # safety cap
+MIN_CONTRACTS_PER_TRADE = 1        # usually 1
+CONTRACTS_FIXED = None             # set to an int to force a fixed qty; else None
+
 # RTH gating / market days
 ENFORCE_RTH = True        # ← set False to allow scans anytime
 MON_FRI_ONLY = True       # weekend guard
@@ -128,7 +134,6 @@ SL_PCT = 0.05     # 5% floor for SL (option mark)
 
 # --- budget & slippage ---
 TOP_N = 5                    # how many candidates to consider/display
-MAX_BUDGET_PER_TRADE = 1000  # hard cap for one contract, in USD
 SLIPPAGE_BUY  = 0.005        # 0.5% buy slippage
 SLIPPAGE_SELL = 0.005        # 0.5% sell slippage (used in PnL calc/logging)
 
@@ -176,12 +181,15 @@ CLOSED_FIELDS = [
     "option_symbol","option_id","expiration","strike",
     "opened_at","closed_at","reason",
 
-    # fills/prices
+    # quantity & dollars
+    "qty","cost_usd","proceeds_usd","pnl_usd",
+
+    # fills/prices (per contract)
     "entry_mark","entry_fill","exit_mark","exit_fill",
     "pnl_pct","capital_after",
 
     # underlying context (at open & at close)
-    "und_entry","und_tp","und_sl","underlying_close",  # underlying_close gathered at exit
+    "und_entry","und_tp","und_sl","underlying_close",
 
     # risk/targets on option
     "tp_mark","sl_mark","delta_est","rr_tp_mult","rr_sl_mult",
@@ -266,6 +274,35 @@ def _cell(x):
             return str(x)
     return x
 
+def _compute_contract_qty(entry_fill: float, free_cash: float) -> int:
+    """
+    Decide how many contracts to buy using *only* a % of available capital:
+      - budget = RISK_PCT_PER_TRADE × free_cash
+      - qty = floor(budget / (entry_fill * 100))
+      - bounded by MIN/MAX caps and actual cash affordability
+      - optional CONTRACTS_FIXED override
+    """
+    if not (math.isfinite(entry_fill) and entry_fill > 0 and math.isfinite(free_cash) and free_cash > 0):
+        return 0
+
+    per_contract_cost = entry_fill * 100.0
+
+    # Optional fixed override
+    if isinstance(CONTRACTS_FIXED, int) and CONTRACTS_FIXED > 0:
+        by_cash = int(free_cash // per_contract_cost)
+        return max(0, min(CONTRACTS_FIXED, by_cash))
+
+    # Pure percent-of-capital sizing
+    risk_budget = free_cash * float(RISK_PCT_PER_TRADE)
+    by_risk = int(risk_budget // per_contract_cost)
+    by_cash = int(free_cash // per_contract_cost)
+
+    qty = max(0, min(by_risk, by_cash))
+    if qty > 0:
+        qty = max(MIN_CONTRACTS_PER_TRADE, min(qty, MAX_CONTRACTS_PER_TRADE))
+        qty = min(qty, by_cash)  # ensure affordability after caps
+    return qty
+
 def read_open_trades():
     if not os.path.exists(OPEN_TRADES_JSON):
         return []
@@ -283,16 +320,17 @@ def _as_float(x, default=0.0):
         return default
 
 def sum_open_cost(trades) -> float:
-    """Cash tied up in currently open option(s), in dollars."""
+    """Cash tied up in currently open option(s), in dollars (qty-aware)."""
     total = 0.0
     for t in trades:
         if t.get("status") == "OPEN":
             entry_basis = _as_float(t.get("entry_fill") or t.get("entry_mark"))
-            total += entry_basis * 100.0
+            qty = int(t.get("qty", 1))
+            total += entry_basis * 100.0 * qty
     return total
 
 def compute_realized_pnl_from_csv() -> float:
-    """Realized PnL from closed trades CSV, in dollars."""
+    """Realized PnL from closed trades CSV, in dollars (qty-aware)."""
     if not os.path.exists(CLOSED_TRADES_CSV):
         return 0.0
     total = 0.0
@@ -301,7 +339,8 @@ def compute_realized_pnl_from_csv() -> float:
         for row in rdr:
             entry_fill = _as_float(row.get("entry_fill") or row.get("entry_mark"))
             exit_fill  = _as_float(row.get("exit_fill")  or row.get("exit_mark"))
-            total += (exit_fill - entry_fill) * 100.0
+            qty        = int(_as_float(row.get("qty"), 1))
+            total += (exit_fill - entry_fill) * 100.0 * qty
     return total
 
 def compute_capital(open_trades_override=None) -> float:
@@ -1352,9 +1391,17 @@ def open_new_trade_from_reco(reco):
                       f"(id={option_id}, sym={option_symbol})")
 
     entry_fill = float(entry_mark) * (1.0 + SLIPPAGE_BUY)
-    est_cost   = entry_fill * 100.0
-    if est_cost > MAX_BUDGET_PER_TRADE:
-        return None, f"Estimated cost ${est_cost:.2f} exceeds budget ${MAX_BUDGET_PER_TRADE:.2f}"
+
+    # --- POSITION SIZING (≤ 6% of available capital) ---
+    existing = read_open_trades()
+    free_cash = compute_capital(existing)
+    qty = _compute_contract_qty(entry_fill, free_cash)
+
+    if qty < 1:
+        return None, (f"Insufficient cash for min size under {RISK_PCT_PER_TRADE:.0%} risk. "
+                      f"Cash=${free_cash:.2f}, per-contract=${entry_fill*100:.2f}")
+
+    est_cost_total = entry_fill * 100.0 * qty
 
     # Convert underlying ATR targets → option TP/SL via delta (fallback 0.50)
     und_entry = float(reco.get("entry_underlying", underlying_entry))
@@ -1370,7 +1417,7 @@ def open_new_trade_from_reco(reco):
 
     delta_est = get_option_delta(option_id)
     if delta_est is None:
-        logger.info(f"[open] {ticker} missing delta, fallback to 0.50")
+        logger.info(f"[open] {ticker} missing delta, fallback to 0.40")
         delta_est = 0.40 
     delta_est = _clamp(delta_est, 0.10, 0.85)
 
@@ -1401,6 +1448,7 @@ def open_new_trade_from_reco(reco):
         "side": "LONG",
         "entry_mark": round(float(entry_mark), 4),
         "entry_fill": round(float(entry_fill), 4),
+        "qty": int(qty),
         "tp_mark": round(float(tp_mark), 4),
         "sl_mark": round(float(sl_mark), 4),
         "atr": atr,
@@ -1465,7 +1513,7 @@ def open_new_trade_from_reco(reco):
     trade["ta_reasons_open"] = trade["ta_snapshot_open"].get("ta_reasons", [])  
 
     existing = read_open_trades()
-    capital_after_open = STARTING_CAPITAL + compute_realized_pnl_from_csv() - (sum_open_cost(existing) + (entry_fill * 100.0))
+    capital_after_open = STARTING_CAPITAL + compute_realized_pnl_from_csv() - (sum_open_cost(existing) + est_cost_total)
     trade["capital_available"] = round(capital_after_open, 2)
 
     return trade, None
@@ -1533,6 +1581,15 @@ def monitor_open_trades():
 
                 underlying_close = get_underlying_price_now(t["ticker"])
 
+                qty = int(t.get("qty", 1))
+                cost_usd = _as_float(t.get("entry_fill") or t.get("entry_mark")) * 100.0 * qty
+                proceeds_usd = float(exit_fill) * 100.0 * qty
+                pnl_usd = proceeds_usd - cost_usd
+                pnl_pct = round((exit_fill - _as_float(t.get("entry_fill") or t.get("entry_mark"))) /
+                                max(_as_float(t.get("entry_fill") or t.get("entry_mark")), 1e-9), 4)
+
+                underlying_close = get_underlying_price_now(t["ticker"])
+
                 closed_row = {
                     # core identity
                     "id": t["id"],
@@ -1547,18 +1604,21 @@ def monitor_open_trades():
                     # times & reason
                     "opened_at": t["opened_at"],
                     "closed_at": t["closed_at"],
-                    "reason": "EOD" if eod_force else ("TP" if hit_tp else "SL"),
+                    "reason": "EOD",
 
-                    # fills/prices
+                    # quantity & dollars
+                    "qty": qty,
+                    "cost_usd": round(cost_usd, 2),
+                    "proceeds_usd": round(proceeds_usd, 2),
+                    "pnl_usd": round(pnl_usd, 2),
+
+                    # per-contract fills/prices
                     "entry_mark": t.get("entry_mark"),
                     "entry_fill": t.get("entry_fill"),
-                    "exit_mark": exit_fill,      # we treat exit_mark as the realized basis after slippage
+                    "exit_mark": exit_fill,
                     "exit_fill": exit_fill,
-                    "pnl_pct": round((exit_fill - _as_float(t.get("entry_fill") or t.get("entry_mark"))) /
-                                    max(_as_float(t.get("entry_fill") or t.get("entry_mark")), 1e-9), 4),
-
-                    # capital snapshot (set later in your existing code after totals calc)
-                    "capital_after": None,  # placeholder, updated below
+                    "pnl_pct": pnl_pct,
+                    "capital_after": None,  # filled later
 
                     # underlying context
                     "und_entry": t.get("und_entry"),
@@ -1583,6 +1643,7 @@ def monitor_open_trades():
                     "ai_snapshot_open": t.get("ai_snapshot_open"),
                     "notes": t.get("notes"),
                 }
+
                 closed_rows.append(closed_row)
                 any_change = True
                 continue
@@ -1600,12 +1661,13 @@ def monitor_open_trades():
         mark = float(mark)
         t["last_mark"] = round(mark, 4)
 
+        qty = int(t.get("qty", 1))
         sim_exit = mark * (1.0 - SLIPPAGE_SELL)
-        pnl_dollars = (sim_exit - entry_basis) * 100.0
-        roi_pct = ((pnl_dollars / (entry_basis * 100.0)) * 100.0) if entry_basis > 0 else 0.0
+        pnl_dollars = (sim_exit - entry_basis) * 100.0 * qty
+        roi_pct = ((pnl_dollars / (entry_basis * 100.0 * max(qty, 1))) * 100.0) if entry_basis > 0 else 0.0
 
         logger.info(
-            f"[monitor] {t['ticker']} {t['direction']} "
+            f"[monitor] {t['ticker']} {t['direction']} x{qty} "
             f"entry={entry_basis:.3f} mark={mark:.3f} "
             f"sim_exit={sim_exit:.3f} PnL=${pnl_dollars:.2f} ROI={roi_pct:.2f}% "
             f"TP={t.get('tp_mark')} SL={t.get('sl_mark')}"
@@ -1618,8 +1680,8 @@ def monitor_open_trades():
             init_sl = float(t.get("sl_mark") or 0.0)
 
         sl_price_cur = float(t.get("sl_mark"))
-        risk_init = max(0.0, entry_basis - init_sl)         # in option-price terms
-        R_dollars = risk_init * 100.0                       # options are x100
+        risk_init = max(0.0, entry_basis - init_sl)         # per-contract risk
+        R_dollars = risk_init * 100.0 * int(t.get("qty", 1))  # total position risk
 
         # 1R trail to breakeven (use initial risk)
         if R_dollars > 0 and pnl_dollars >= R_dollars:
@@ -1669,6 +1731,15 @@ def monitor_open_trades():
 
             underlying_close = get_underlying_price_now(t["ticker"])
 
+            qty = int(t.get("qty", 1))
+            cost_usd = _as_float(t.get("entry_fill") or t.get("entry_mark")) * 100.0 * qty
+            proceeds_usd = float(exit_fill) * 100.0 * qty
+            pnl_usd = proceeds_usd - cost_usd
+            pnl_pct = round((exit_fill - _as_float(t.get("entry_fill") or t.get("entry_mark"))) /
+                            max(_as_float(t.get("entry_fill") or t.get("entry_mark")), 1e-9), 4)
+
+            underlying_close = get_underlying_price_now(t["ticker"])
+
             closed_row = {
                 # core identity
                 "id": t["id"],
@@ -1683,18 +1754,21 @@ def monitor_open_trades():
                 # times & reason
                 "opened_at": t["opened_at"],
                 "closed_at": t["closed_at"],
-                "reason": "EOD" if eod_force else ("TP" if hit_tp else "SL"),
+                "reason": "TP" if hit_tp else "SL",
 
-                # fills/prices
+                # quantity & dollars
+                "qty": qty,
+                "cost_usd": round(cost_usd, 2),
+                "proceeds_usd": round(proceeds_usd, 2),
+                "pnl_usd": round(pnl_usd, 2),
+
+                # per-contract fills/prices
                 "entry_mark": t.get("entry_mark"),
                 "entry_fill": t.get("entry_fill"),
-                "exit_mark": exit_fill,      # we treat exit_mark as the realized basis after slippage
+                "exit_mark": exit_fill,
                 "exit_fill": exit_fill,
-                "pnl_pct": round((exit_fill - _as_float(t.get("entry_fill") or t.get("entry_mark"))) /
-                                  max(_as_float(t.get("entry_fill") or t.get("entry_mark")), 1e-9), 4),
-
-                # capital snapshot (set later in your existing code after totals calc)
-                "capital_after": None,  # placeholder, updated below
+                "pnl_pct": pnl_pct,
+                "capital_after": None,  # set later
 
                 # underlying context
                 "und_entry": t.get("und_entry"),
@@ -1719,6 +1793,7 @@ def monitor_open_trades():
                 "ai_snapshot_open": t.get("ai_snapshot_open"),
                 "notes": t.get("notes"),
             }
+
             closed_rows.append(closed_row)
 
             any_change = True
@@ -1732,7 +1807,8 @@ def monitor_open_trades():
         for row in closed_rows:
             entry_fill = _as_float(row.get("entry_fill") or row.get("entry_mark"))
             exit_fill  = _as_float(row.get("exit_fill")  or row.get("exit_mark"))
-            new_realized += (exit_fill - entry_fill) * 100.0
+            qty_closed = int(_as_float(row.get("qty"), 1))
+            new_realized += (exit_fill - entry_fill) * 100.0 * qty_closed
 
         capital_after = STARTING_CAPITAL + realized_so_far + new_realized - sum_open_cost(keep)
         cap_rounded = round(capital_after, 2)
@@ -1754,10 +1830,11 @@ def monitor_open_trades():
             side = row["direction"]
             efill = _as_float(row.get("entry_fill") or row.get("entry_mark"))
             xfill = _as_float(row.get("exit_fill")  or row.get("exit_mark"))
-            pnl_usd = (xfill - efill) * 100.0
+            qty_closed = int(row.get("qty", 1))
+            pnl_usd = (xfill - efill) * 100.0 * qty_closed
             pnl_pc = ((xfill - efill) / efill * 100.0) if efill > 0 else 0.0
             logger.info(
-                f"[close] {sym} {side} {row['reason']} "
+                f"[close] {sym} {side} {row['reason']} x{qty_closed} "
                 f"entry={efill:.3f} exit={xfill:.3f} "
                 f"PnL=${pnl_usd:.2f} ({pnl_pc:.2f}%) cash=${cap_rounded:.2f}"
             )
@@ -1797,11 +1874,14 @@ def maybe_open_top_trade(recs_json):
             continue
         trades.append(trade)
         write_open_trades(trades)
+        qty = int(trade.get("qty", 1))
+        total_cost = trade["entry_fill"] * 100.0 * qty  # per-contract fill * 100 * qty
+
         logger.info(
-            f"[open] NEW {trade['ticker']} {trade['direction']} "
+            f"[open] NEW {trade['ticker']} {trade['direction']} x{qty} "
             f"fill={trade['entry_fill']} (mark={trade['entry_mark']}) → "
             f"TP {trade['tp_mark']} / SL {trade['sl_mark']} "
-            f"(budget ≤ ${MAX_BUDGET_PER_TRADE:.2f}) cash=${trade.get('capital_available', 0):.2f}"
+            f"(total cost ≈ ${total_cost:.2f}) cash=${trade.get('capital_available', 0):.2f}"
         )
         return  # take only one
     logger.info("[open] No affordable candidates in the top list.")
@@ -2031,7 +2111,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.11)…")
+    logger.info("Options Bot starting (V1.0.12)…")
     ensure_rh()
 
     # Ensure state files exist
