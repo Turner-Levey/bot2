@@ -138,8 +138,8 @@ SLIPPAGE_BUY  = 0.005        # 0.5% buy slippage
 SLIPPAGE_SELL = 0.005        # 0.5% sell slippage (used in PnL calc/logging)
 
 # blending
-TA_WEIGHT = 0.7
-AI_WEIGHT = 0.3
+TA_WEIGHT = 0.75
+AI_WEIGHT = 0.25
 
 # Indicators
 ATR_WINDOW       = 14
@@ -149,11 +149,17 @@ ADX_MIN_TREND    = 20.0   # trend-strength gate
 BREAKOUT_PCT     = 0.002  # need close >= 0.2% above 20-bar high to count as breakout
 VOL_SURGE_MULT   = 1.5    # volume confirmation multiplier vs 20-bar avg
 
+# --- structure & liquidity knobs (NEW) ---
+EMA_VWAP_ALIGN_REQUIRED = True       # require EMA/VWAP alignment with trade
+MIN_EMA_SEP_PCT   = 0.001            # 0.10% min separation |EMA9-EMA21|/EMA21
+MIN_VWAP_DIST_PCT = 0.001            # 0.10% min |Close-VWAP|/VWAP in trade dir
+MAX_SPREAD_PCT    = 0.18             # skip contracts with >18% bid/ask spread
+
 # Selective scan thresholds / limits
-TA_SCORE_MIN    = 1.6
+TA_SCORE_MIN    = 1.8
 TA_CONF_MIN     = 0.55
 MAX_AI_EVALS    = 5
-AI_CONF_MIN     = 0.45
+AI_CONF_MIN     = 0.5
 AI_SCORE_MIN    = 1.5
 AI_COOLDOWN_MIN = 1  # don’t re-AI-score same ticker within X minutes
 
@@ -640,6 +646,20 @@ def evaluate_signal_ta(df: pd.DataFrame) -> dict:
             if close_ > prev_close: score += 0.4; reasons.append("Bullish volume surge")
             elif close_ < prev_close: score -= 0.4; reasons.append("Bearish volume surge")
 
+    # --- NEW: continuous EMA/VWAP structure adj (dominant in early data) ---
+    if pd.notna(ema9) and pd.notna(ema21) and pd.notna(close_) and pd.notna(vwap):
+        ema_sep   = (ema9 - ema21) / (abs(ema21) + 1e-9)    # signed
+        vwap_dist = (close_ - vwap) / (abs(vwap) + 1e-9)    # signed
+        # soft-bounded contribution; scale keeps it subtle but meaningful
+        struct_adj = 0.8 * np.tanh(ema_sep * 80) + 0.4 * np.tanh(vwap_dist * 80)
+        if not (vol_ok and adx_ok):      # tone it down when gates are weak
+            struct_adj *= 0.4
+        score += struct_adj
+        reasons.append(
+            f"Structure adj {struct_adj:+.2f} "
+            f"(EMA sep {ema_sep*100:.2f}%, VWAP dist {vwap_dist*100:.2f}%)"
+        )
+
     ta_direction = "CALL" if score > 0 else "PUT"
     ta_confidence = round(min(1.0, abs(score) / 3.2), 2)
     return {"ta_score": round(score, 2), "ta_direction": ta_direction, "ta_confidence": ta_confidence, "ta_reasons": reasons}
@@ -654,6 +674,10 @@ def ask_gpt_for_hybrid_score(ticker: str, df_ta: pd.DataFrame) -> dict:
         return {}
     last = df_ta.iloc[-1]
     prev = df_ta.iloc[-2] if len(df_ta) >= 2 else last
+
+    v = last.get("Volume")
+    vol_safe = 0 if v is None or (isinstance(v, float) and (pd.isna(v) or not np.isfinite(v))) else int(float(v))
+
     context = {
         "ticker": ticker,
         "timestamp": df_ta.index[-1].isoformat(),
@@ -667,8 +691,8 @@ def ask_gpt_for_hybrid_score(ticker: str, df_ta: pd.DataFrame) -> dict:
         "vwap": round(float(last["VWAP"]), 4),
         "day_high20": round(float(last["DayHigh20"]), 4),
         "day_low20": round(float(last["DayLow20"]), 4),
-        "volume": int(last["Volume"]),
-        "volma20": None if pd.isna(last["VolMA20"]) else int(last["VolMA20"]),
+        "volume": vol_safe,
+        "volma20": None if pd.isna(last["VolMA20"]) else int(float(last["VolMA20"])),
         "prev_close": round(float(prev["Close"]), 4),
     }
     system = (
@@ -712,16 +736,32 @@ def ask_gpt_for_hybrid_score(ticker: str, df_ta: pd.DataFrame) -> dict:
 
 
 def blend_scores(ta_dir: str, ta_score: float, ta_conf: float, ai: dict) -> dict:
-    """Blend TA and AI into final direction & score."""
     if not ai:
-        return {"direction": ta_dir, "score": round(float(ta_score), 2), "confidence": round(float(ta_conf), 2), "blend_notes": "TA-only (AI unavailable)"}
-    def sign(d): return 1 if d == "CALL" else -1
+        return {
+            "direction": ta_dir,
+            "score": round(float(ta_score), 2),
+            "confidence": round(float(ta_conf), 2),
+            "blend_notes": "TA-only (AI unavailable)"
+        }
+
     ta_component = TA_WEIGHT * ta_score
-    ai_component = AI_WEIGHT * (sign(ai["ai_direction"]) * 3.2 * ai["ai_confidence"])  # 3.2 ≈ TA scale
+
+    # Signed AI confidence: positive if AI agrees with TA, negative if it contradicts
+    agrees = (ai.get("ai_direction") == ta_dir)
+    ai_signed = (float(ai.get("ai_confidence", 0.0)) * (1 if agrees else -1))
+    ai_component = AI_WEIGHT * (3.2 * ai_signed)  # 3.2≈TA score scale
+
     blended = ta_component + ai_component
     direction = "CALL" if blended > 0 else "PUT"
     confidence = min(1.0, abs(blended) / 3.2)
-    return {"direction": direction, "score": round(float(blended), 2), "confidence": round(float(confidence), 2), "blend_notes": f"blend TA({TA_WEIGHT}) + AI({AI_WEIGHT})"}
+
+    return {
+        "direction": direction,
+        "score": round(float(blended), 2),
+        "confidence": round(float(confidence), 2),
+        "blend_notes": f"blend TA({TA_WEIGHT}) + AI_signed({AI_WEIGHT})",
+        "ai_signed_conf": round(ai_signed, 2)
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4) DATA & PREFILTER / CONFIRM
@@ -811,6 +851,16 @@ def ta_prefilter(
             vol_ok = (atr_pct is not None and atr_pct >= MIN_ATR_PCT)
             adx_ok = (adx is not None and adx >= ADX_MIN_TREND)
 
+            # --- NEW: alignment gate (EMA/VWAP in trade direction) ---
+            align_ok = True
+            if EMA_VWAP_ALIGN_REQUIRED and all(pd.notna(row.get(k)) for k in ("EMA9","EMA21","VWAP","Close")):
+                ema_sep_pct   = (row["EMA9"] / row["EMA21"] - 1.0) if row["EMA21"] else 0.0
+                vwap_dist_pct = (row["Close"] / row["VWAP"] - 1.0) if row["VWAP"] else 0.0
+                if ta["ta_direction"] == "CALL":
+                    align_ok = (row["EMA9"] > row["EMA21"] and ema_sep_pct >= MIN_EMA_SEP_PCT and vwap_dist_pct >= MIN_VWAP_DIST_PCT)
+                else:
+                    align_ok = (row["EMA9"] < row["EMA21"] and (-ema_sep_pct) >= MIN_EMA_SEP_PCT and (-vwap_dist_pct) >= MIN_VWAP_DIST_PCT)
+
             di = {
                 "ticker": t,
                 "ta_score": ta.get("ta_score"),
@@ -835,12 +885,17 @@ def ta_prefilter(
                 },
             }
 
+            # Base pass on TA thresholds
             passed = (
                 di["ta_score"] is not None and
                 di["ta_confidence"] is not None and
                 abs(float(di["ta_score"])) >= float(min_abs_score) and
                 float(di["ta_confidence"]) >= float(min_conf)
             )
+
+            # Fold in alignment requirement
+            di["align_ok"] = bool(align_ok)
+            passed = passed and align_ok
             di["pass"] = bool(passed)
             diagnostics.append(di)
 
@@ -950,7 +1005,7 @@ def choose_sensible_expirations(symbol: str, max_to_try: int = 6) -> list[str]:
     return (fridays + others)[:max_to_try]
 
 
-def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
+def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.5):
     """
     Given prefiltered TA candidates (dicts that at least contain {"ticker"}),
     recompute TA here on 5m, run AI on the top_k by TA strength, and return the
@@ -996,12 +1051,18 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
             _last_ai_eval[tkr] = now_central()
             evals += 1
 
+            # --- NEW: hard guard — strong AI disagreement
+            if ai and (ai.get("ai_direction") != ta.get("ta_direction")) and float(ai.get("ai_confidence", 0)) >= 0.60:
+                continue
+
             blended = blend_scores(
                 ta_dir=ta["ta_direction"],
                 ta_score=ta["ta_score"],
                 ta_conf=ta["ta_confidence"],
                 ai=ai
             )
+
+            ai_signed = blended.get("ai_signed_conf")  # for logs/JSON
 
             last = df_ta.iloc[-1]
             entry_price = float(last["Close"])
@@ -1064,6 +1125,7 @@ def ai_confirm_candidates(cands, top_k: int = 5, min_ai_conf: float = 0.55):
                 "ta": ta,
                 "ai": ai,
                 "rr_tp_mult": rr_mult,
+                "ai_signed_confidence": ai_signed,
             })
 
             if evals >= MAX_AI_EVALS:
@@ -1238,6 +1300,8 @@ def pick_option_contract(symbol: str, direction: str, underlying_price: float, e
                 # select by distance to midpoint + spread
                 dist = min(abs(er - 0.5*(TARGET_EXPECTED_RETURN_LO + TARGET_EXPECTED_RETURN_HI)) for er in in_range)
                 spct = _spread_pct(bid, ask, mark)
+                if spct > MAX_SPREAD_PCT:
+                    continue  # skip illiquid contracts
                 key = (dist, spct, abs(delta - 0.40))
                 pick = {
                     "option_symbol": inst.get("symbol") or inst.get("id"),
@@ -1588,8 +1652,6 @@ def monitor_open_trades():
                 pnl_pct = round((exit_fill - _as_float(t.get("entry_fill") or t.get("entry_mark"))) /
                                 max(_as_float(t.get("entry_fill") or t.get("entry_mark")), 1e-9), 4)
 
-                underlying_close = get_underlying_price_now(t["ticker"])
-
                 closed_row = {
                     # core identity
                     "id": t["id"],
@@ -1672,6 +1734,30 @@ def monitor_open_trades():
             f"sim_exit={sim_exit:.3f} PnL=${pnl_dollars:.2f} ROI={roi_pct:.2f}% "
             f"TP={t.get('tp_mark')} SL={t.get('sl_mark')}"
         )
+
+        # --- NEW: structure guard: if structure flips, tighten to BE when green
+        try:
+            df_now = fetch_5m_df(t["ticker"])
+            if df_now is not None and not df_now.empty and len(df_now) >= 26:
+                last_now = compute_indicators(df_now).iloc[-1]
+                ema9n  = float(last_now.get("EMA9"))
+                ema21n = float(last_now.get("EMA21"))
+                vwapn  = float(last_now.get("VWAP"))
+                closen = float(last_now.get("Close"))
+
+                struct_fail = (
+                    (t["direction"] == "CALL" and (ema9n < ema21n or closen < vwapn)) or
+                    (t["direction"] == "PUT"  and (ema9n > ema21n or closen > vwapn))
+                )
+
+                if struct_fail and pnl_dollars > 0:
+                    new_sl = max(float(t["sl_mark"]), entry_basis)  # move to breakeven
+                    if new_sl > float(t["sl_mark"]) + 1e-6:
+                        t["sl_mark"] = round(new_sl, 4)
+                        logger.info(f"[guard] {t['ticker']} structure flip → SL → BE")
+                        any_change = True
+        except Exception:
+            pass
 
         # --- R math based on INITIAL risk ---
         try:
@@ -1940,7 +2026,9 @@ def log_ai_top3(confirmed):
         return
     as_of = now_central().isoformat()
     top3 = confirmed[:3]
-    fields = ["as_of","rank","ticker","direction","confidence","score","entry_price","tp_underlying","sl_underlying","ai_confidence","ai_direction"]
+    fields = ["as_of","rank","ticker","direction","confidence","score",
+              "entry_price","tp_underlying","sl_underlying",
+              "ai_confidence","ai_direction","ai_signed_confidence"]
     for i, rj in enumerate(top3, start=1):
         ai = rj.get("ai", {})
         row = {
@@ -1955,6 +2043,7 @@ def log_ai_top3(confirmed):
             "sl_underlying": rj.get("sl_underlying"),
             "ai_confidence": ai.get("ai_confidence"),
             "ai_direction": ai.get("ai_direction"),
+            "ai_signed_confidence": rj.get("ai_signed_confidence", rj.get("ai",{}).get("ai_signed_conf"))
         }
         append_csv_row(AI_LOG_CSV, fields, row)
 
@@ -2096,6 +2185,7 @@ def run_cycle_selective():
                 "sl_underlying": rj["sl_underlying"],
                 "blend_notes": rj["blend_notes"],
                 "rr_tp_mult": rj.get("rr_tp_mult"),
+                "ai_signed_confidence": rj.get("ai_signed_confidence"),
                 "setup": {
                     "indicators": rj["indicators"],
                     "ta": rj["ta"],
@@ -2111,7 +2201,7 @@ def run_cycle_selective():
 
 
 def main_loop():
-    logger.info("Options Bot starting (V1.0.13)…")
+    logger.info("Options Bot starting (V1.0.14)…")
     ensure_rh()
 
     # Ensure state files exist
